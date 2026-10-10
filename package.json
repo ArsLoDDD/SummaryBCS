@@ -11,6 +11,7 @@
     "build:template": "tsc -b && vite build --mode template",
     "build:editor": "tsc -b && vite build --mode editor",
     "build:all": "npm run build && npm run build:template && npm run build:editor",
+    "build:ci": "npm run build && npm run build:editor",
     "preview": "vite preview",
     "tauri": "tauri",
     "app:summary": "npm run tauri:dev:summary",
@@ -28,6 +29,7 @@
     "test": "vitest run",
     "lint": "eslint src --max-warnings=0",
     "check:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml --check && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+    "test:ci": "npm run lint && npm run test && npm run build:ci && npm run check:rust && cargo test --manifest-path src-tauri/Cargo.toml",
     "test:full": "npm run lint && npm run test && npm run build:all && npm run check:rust && cargo test --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {

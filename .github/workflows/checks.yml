@@ -30,4 +30,5 @@ jobs:
           components: rustfmt, clippy
       - run: npm ci
       - run: npm audit --audit-level=high
-      - run: npm run test:full
+      - name: Перевірити «Зведення БЧС» і «Редактор БЧС»
+        run: npm run test:ci

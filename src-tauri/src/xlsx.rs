@@ -32,6 +32,9 @@ pub fn validate_archive(archive: &mut ZipArchive<File>) -> Result<(), String> {
         let entry = archive
             .by_index(index)
             .map_err(|_| "Не вдалося перевірити структуру XLSX.".to_string())?;
+        if entry.name().contains('\\') || entry.enclosed_name().is_none() {
+            return Err("Excel-файл містить небезпечний внутрішній шлях.".into());
+        }
         total = total
             .checked_add(entry.size())
             .ok_or_else(|| "XLSX має некоректний розмір.".to_string())?;
@@ -239,6 +242,7 @@ fn esc(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+#[allow(dead_code)]
 pub fn write_styled_workbook(
     path: &Path,
     sheet_name: &str,
@@ -286,15 +290,13 @@ pub fn write_styled_workbook(
 }
 
 /// Writes the editable BCS workbook used by the template builder and the
-/// in-app editor.  Keeping this separate from `write_styled_workbook` avoids
-/// changing the byte layout of the already tested summary export.
-pub fn write_bcs_workbook_with_dictionaries(
+/// in-app editor. Keeping this separate from `write_styled_workbook` preserves
+/// the calculation settings expected by the BCS formulas.
+pub fn write_bcs_workbook(
     path: &Path,
     bcs_sheet_xml: &str,
-    dictionaries_sheet_xml: &str,
     styles: &str,
     theme: &str,
-    defined_names_xml: &str,
 ) -> Result<(), String> {
     let file = File::create(path).map_err(|_| "Не вдалося створити Excel-файл.".to_string())?;
     let mut archive = ZipWriter::new(file);
@@ -302,29 +304,23 @@ pub fn write_bcs_workbook_with_dictionaries(
     let files = [
         (
             "[Content_Types].xml",
-            "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/><Override PartName=\"/xl/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/></Types>".to_string(),
+            "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/><Override PartName=\"/xl/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/></Types>",
         ),
         (
             "_rels/.rels",
-            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>".to_string(),
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>",
         ),
         (
             "xl/_rels/workbook.xml.rels",
-            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet2.xml\"/><Relationship Id=\"rIdStyles\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/><Relationship Id=\"rIdTheme\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme\" Target=\"theme/theme1.xml\"/></Relationships>".to_string(),
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rIdStyles\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/><Relationship Id=\"rIdTheme\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme\" Target=\"theme/theme1.xml\"/></Relationships>",
         ),
         (
             "xl/workbook.xml",
-            format!(
-                "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"БЧС\" sheetId=\"1\" r:id=\"rId1\"/><sheet name=\"Довідники\" sheetId=\"2\" r:id=\"rId2\"/></sheets><definedNames>{defined_names_xml}</definedNames><calcPr calcId=\"191029\" fullCalcOnLoad=\"1\" forceFullCalc=\"1\"/></workbook>"
-            ),
+            "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"БЧС\" sheetId=\"1\" r:id=\"rId1\"/></sheets><calcPr calcId=\"191029\" fullCalcOnLoad=\"1\" forceFullCalc=\"1\"/></workbook>",
         ),
-        ("xl/styles.xml", styles.to_string()),
-        ("xl/theme/theme1.xml", theme.to_string()),
-        ("xl/worksheets/sheet1.xml", bcs_sheet_xml.to_string()),
-        (
-            "xl/worksheets/sheet2.xml",
-            dictionaries_sheet_xml.to_string(),
-        ),
+        ("xl/styles.xml", styles),
+        ("xl/theme/theme1.xml", theme),
+        ("xl/worksheets/sheet1.xml", bcs_sheet_xml),
     ];
 
     for (name, content) in files {
@@ -339,4 +335,49 @@ pub fn write_bcs_workbook_with_dictionaries(
         .finish()
         .map_err(|_| "Не вдалося завершити Excel-файл.".to_string())?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_test_archive(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        for (name, value) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(value).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_a_vba_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("macro-enabled.xlsm");
+        write_test_archive(
+            &path,
+            &[
+                ("[Content_Types].xml", b"<Types/>"),
+                ("xl/vbaProject.bin", b"VBA PROJECT PLACEHOLDER"),
+            ],
+        );
+
+        let file = File::open(path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let error = validate_archive(&mut archive).unwrap_err();
+        assert!(error.contains("макросами"));
+    }
+
+    #[test]
+    fn validation_still_rejects_unsafe_archive_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unsafe.xlsm");
+        write_test_archive(&path, &[("../outside.xml", b"<xml/>")]);
+
+        let file = File::open(path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let error = validate_archive(&mut archive).unwrap_err();
+        assert!(error.contains("небезпечний внутрішній шлях"));
+    }
 }

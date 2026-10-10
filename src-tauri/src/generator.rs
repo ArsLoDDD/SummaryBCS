@@ -288,7 +288,7 @@ fn canonical_location(value: &str, locations: &[String]) -> Result<String, Strin
         .find(|candidate| normalize(candidate) == normalized)
         .cloned()
         .ok_or_else(|| {
-            format!("Невідоме місце «{value}». Оберіть значення з довідника «Де знаходиться».")
+            format!("Невідоме місце «{value}». Оберіть значення зі списку «Де знаходиться».")
         })
 }
 
@@ -570,15 +570,11 @@ fn section_for(kind: BlockKind, name: &str) -> String {
 fn export_prepared(request: &PreparedRequest) -> Result<String, String> {
     let schema = schema()?;
     let bcs_sheet = build_bcs_sheet(request, &schema)?;
-    let dictionaries_sheet = build_dictionaries_sheet(&schema);
-    let names = defined_names(&schema);
-    xlsx::write_bcs_workbook_with_dictionaries(
+    xlsx::write_bcs_workbook(
         &request.output_path,
         &bcs_sheet,
-        &dictionaries_sheet,
         &bcs_styles(),
         include_str!("../resources/bcs-reference-theme.xml"),
-        &names,
     )?;
     Ok(request.output_path.to_string_lossy().into_owned())
 }
@@ -820,27 +816,27 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
         .join(" ");
     let mut validations = Vec::new();
     if !crew_validation_cells.is_empty() {
-        validations.push(data_validation(
+        validations.push(inline_data_validation(
             &h_cells,
-            "CrewStatuses",
+            CREW_STATUSES.iter().copied(),
             "Оберіть статус зі списку.",
-        ));
-        validations.push(data_validation(
+        )?);
+        validations.push(inline_data_validation(
             &j_cells,
-            "UavTypes",
+            UAV_TYPES.iter().copied(),
             "Оберіть тип БпАК зі списку.",
-        ));
+        )?);
     }
-    validations.push(data_validation(
+    validations.push(inline_data_validation(
         &format!("L7:L{data_end}"),
-        "Ranks",
+        RANKS.iter().copied(),
         "Оберіть військове звання зі списку.",
-    ));
-    validations.push(data_validation(
+    )?);
+    validations.push(inline_data_validation(
         &format!("O7:O{data_end}"),
-        "Locations",
+        schema.locations.iter().map(String::as_str),
         "Оберіть місце зі списку.",
-    ));
+    )?);
     sheet.push_str(&format!(
         "<dataValidations count=\"{}\">{}</dataValidations>",
         validations.len(),
@@ -851,12 +847,36 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
     Ok(sheet)
 }
 
-fn data_validation(cells: &str, list_name: &str, error: &str) -> String {
-    format!(
-        "<dataValidation type=\"list\" allowBlank=\"1\" showErrorMessage=\"1\" errorStyle=\"stop\" errorTitle=\"Недопустиме значення\" error=\"{}\" sqref=\"{}\"><formula1>{list_name}</formula1></dataValidation>",
+fn inline_data_validation<'a>(
+    cells: &str,
+    values: impl IntoIterator<Item = &'a str>,
+    error: &str,
+) -> Result<String, String> {
+    let values = values.into_iter().collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err("Випадаючий список не може бути порожнім.".into());
+    }
+    if values
+        .iter()
+        .any(|value| value.contains(',') || value.contains('"'))
+    {
+        return Err("Значення випадаючого списку не може містити кому або лапки.".into());
+    }
+
+    // Excel limits a literal data-validation list (including its surrounding
+    // quotes) to 255 UTF-16 code units. Keeping the values inline removes the
+    // need for a separate lookup worksheet or workbook-level defined names.
+    let formula = format!("\"{}\"", values.join(","));
+    if formula.encode_utf16().count() > 255 {
+        return Err("Випадаючий список перевищує обмеження Excel у 255 символів.".into());
+    }
+
+    Ok(format!(
+        "<dataValidation type=\"list\" allowBlank=\"1\" showErrorMessage=\"1\" errorStyle=\"stop\" errorTitle=\"Недопустиме значення\" error=\"{}\" sqref=\"{}\"><formula1>{}</formula1></dataValidation>",
         esc(error),
-        esc(cells)
-    )
+        esc(cells),
+        esc(&formula),
+    ))
 }
 
 fn countifs_formula(data_end: usize, extra_pairs: &[(&str, &str)], exclude_absent: bool) -> String {
@@ -935,6 +955,20 @@ fn crew_status_group(status: &str) -> &'static str {
     } else {
         "inactive"
     }
+}
+
+fn crew_status_formulas(data_end: usize) -> (String, String, String) {
+    let forming = format!("COUNTIF($H$7:$H${data_end},\"форм*\")");
+    let working =
+        format!("COUNTIF($H$7:$H${data_end},\"прац*\")+COUNTIF($H$7:$H${data_end},\"Активний\")");
+    let inactive = format!("COUNTIF($H$7:$H${data_end},\"<>\")-({forming})-({working})");
+    (forming, working, inactive)
+}
+
+fn unique_crew_count_formula(data_end: usize) -> String {
+    format!(
+        "SUMPRODUCT(IFERROR((($Q$7:$Q${data_end}=\"Екіпаж\")*($M$7:$M${data_end}<>\"\"))/COUNTIFS($M$7:$M${data_end},$M$7:$M${data_end},$Q$7:$Q${data_end},\"Екіпаж\"),0))"
+    )
 }
 
 fn write_summary(
@@ -1118,9 +1152,7 @@ fn write_summary(
         .map(|(_, person)| person.full_name.to_uppercase())
         .collect::<HashSet<_>>()
         .len() as i64;
-    let unique_crew_formula = format!(
-        "SUMPRODUCT(($Q$7:$Q${data_end}=\"Екіпаж\")*($M$7:$M${data_end}<>\"\")/COUNTIFS($M$7:$M${data_end},$M$7:$M${data_end},$Q$7:$Q${data_end},\"Екіпаж\"))"
-    );
+    let unique_crew_formula = unique_crew_count_formula(data_end);
     let total_crews = request
         .blocks
         .iter()
@@ -1155,19 +1187,21 @@ fn write_summary(
         ),
     ];
     for uav_type in SUMMARY_UAV_TYPES {
+        let crew_count = request
+            .blocks
+            .iter()
+            .filter(|block| block.kind == BlockKind::Crew && block.uav_type == uav_type)
+            .count() as i64;
+        if crew_count == 0 {
+            continue;
+        }
         functional.push((
             format!("Екіпажів — {uav_type}"),
             format!("COUNTIF($J$7:$J${data_end},\"{}\")", formula_text(uav_type)),
-            request
-                .blocks
-                .iter()
-                .filter(|block| block.kind == BlockKind::Crew && block.uav_type == uav_type)
-                .count() as i64,
+            crew_count,
         ));
     }
-    let forming_formula = format!("COUNTIF($H$7:$H${data_end},\"форм*\")");
-    let working_formula =
-        format!("COUNTIF($H$7:$H${data_end},\"прац*\")+COUNTIF($H$7:$H${data_end},\"Активний\")");
+    let (forming_formula, working_formula, inactive_formula) = crew_status_formulas(data_end);
     functional.push((
         "Екіпажів — Формуються".to_string(),
         forming_formula.clone(),
@@ -1180,7 +1214,7 @@ fn write_summary(
     ));
     functional.push((
         "Екіпажів — Не активні".to_string(),
-        format!("COUNTIF($H$7:$H${data_end},\"<>\")-{forming_formula}-{working_formula}"),
+        inactive_formula,
         inactive_crews,
     ));
     let mut seen_sections = HashSet::new();
@@ -1270,92 +1304,6 @@ fn write_summary(
     Ok(())
 }
 
-fn build_dictionaries_sheet(schema: &Schema) -> String {
-    let headers = [
-        "Статус екіпажу",
-        "Тип БпАК",
-        "Де знаходиться",
-        "Військове звання",
-        "Колір / правило",
-    ];
-    let rules = [
-        "Зелений — екіпаж працює",
-        "Жовтий — екіпаж формується",
-        "Червоний — екіпаж не активний",
-        "Фіолетовий — управління роти",
-        "Бузковий — управління взводу",
-        "Блакитний — інші блоки",
-        "Рожевий — прикомандировані та оперативно підпорядковані",
-        "Помаранчевий — тимчасово прибулі",
-        "Кількість в/с працює в екіпажах — фактична кількість людей, які зараз працюють в екіпажі",
-        "Кількість в/с — кількість людей, доданих до екіпажу або іншого блоку",
-    ];
-    let rows = CREW_STATUSES
-        .len()
-        .max(UAV_TYPES.len())
-        .max(schema.locations.len())
-        .max(RANKS.len())
-        .max(rules.len());
-    let mut sheet = String::from(
-        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetViews><sheetView showGridLines=\"0\" workbookViewId=\"0\"><pane ySplit=\"1\" topLeftCell=\"A2\" activePane=\"bottomLeft\" state=\"frozen\"/></sheetView></sheetViews><cols><col min=\"1\" max=\"1\" width=\"24\" customWidth=\"1\"/><col min=\"2\" max=\"2\" width=\"30\" customWidth=\"1\"/><col min=\"3\" max=\"3\" width=\"30\" customWidth=\"1\"/><col min=\"4\" max=\"4\" width=\"28\" customWidth=\"1\"/><col min=\"5\" max=\"5\" width=\"46\" customWidth=\"1\"/></cols><sheetData><row r=\"1\" ht=\"30\" customHeight=\"1\">",
-    );
-    for (index, header) in headers.iter().enumerate() {
-        sheet.push_str(&text_cell(index, 1, header, 3));
-    }
-    sheet.push_str("</row>");
-    for index in 0..rows {
-        let row = index + 2;
-        sheet.push_str(&format!("<row r=\"{row}\" ht=\"24\" customHeight=\"1\">"));
-        sheet.push_str(&text_cell(
-            0,
-            row,
-            CREW_STATUSES.get(index).copied().unwrap_or(""),
-            3,
-        ));
-        sheet.push_str(&text_cell(
-            1,
-            row,
-            UAV_TYPES.get(index).copied().unwrap_or(""),
-            3,
-        ));
-        sheet.push_str(&text_cell(
-            2,
-            row,
-            schema
-                .locations
-                .get(index)
-                .map(String::as_str)
-                .unwrap_or(""),
-            3,
-        ));
-        sheet.push_str(&text_cell(
-            3,
-            row,
-            RANKS.get(index).copied().unwrap_or(""),
-            3,
-        ));
-        sheet.push_str(&text_cell(
-            4,
-            row,
-            rules.get(index).copied().unwrap_or(""),
-            3,
-        ));
-        sheet.push_str("</row>");
-    }
-    sheet.push_str("</sheetData><autoFilter ref=\"A1:E1\"/><pageMargins left=\"0.25\" right=\"0.25\" top=\"0.3\" bottom=\"0.3\" header=\"0\" footer=\"0\"/></worksheet>");
-    sheet
-}
-
-fn defined_names(schema: &Schema) -> String {
-    format!(
-        "<definedName name=\"CrewStatuses\">'Довідники'!$A$2:$A${}</definedName><definedName name=\"UavTypes\">'Довідники'!$B$2:$B${}</definedName><definedName name=\"Locations\">'Довідники'!$C$2:$C${}</definedName><definedName name=\"Ranks\">'Довідники'!$D$2:$D${}</definedName>",
-        CREW_STATUSES.len() + 1,
-        UAV_TYPES.len() + 1,
-        schema.locations.len() + 1,
-        RANKS.len() + 1,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1405,8 +1353,16 @@ mod tests {
         value
     }
 
+    fn entry_names(path: &Path) -> Vec<String> {
+        let file = File::open(path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect()
+    }
+
     #[test]
-    fn exports_blank_template_with_dictionaries_validations_and_formulas() {
+    fn exports_blank_template_with_inline_validations_and_formulas() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("template.xlsx");
         export_template(TemplateRequest {
@@ -1421,16 +1377,39 @@ mod tests {
 
         let workbook = read_entry(&path, "xl/workbook.xml");
         let sheet = read_entry(&path, "xl/worksheets/sheet1.xml");
-        let dictionaries = read_entry(&path, "xl/worksheets/sheet2.xml");
         let styles = read_entry(&path, "xl/styles.xml");
-        assert!(workbook.contains("Довідники"));
-        assert!(workbook.contains("name=\"Locations\""));
-        assert!(workbook.contains("name=\"Ranks\""));
+        let names = entry_names(&path);
+        assert!(workbook.contains("<sheet name=\"БЧС\""));
+        assert!(!workbook.contains("Довідники"));
+        assert!(!workbook.contains("Аналітика"));
+        assert_eq!(workbook.matches("<sheet ").count(), 1);
+        assert!(!workbook.contains("<definedNames>"));
+        assert!(!workbook.contains("name=\"Locations\""));
+        assert!(!workbook.contains("name=\"Ranks\""));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("xl/worksheets/sheet"))
+                .count(),
+            1
+        );
+        assert!(!names.iter().any(|name| name == "xl/worksheets/sheet2.xml"));
         assert!(sheet.contains("sqref=\"L7:L11\""));
         assert!(sheet.contains("sqref=\"O7:O11\""));
+        assert!(sheet.contains("<formula1>&quot;Працюючий,Формується,Не активний&quot;</formula1>"));
+        assert!(sheet.contains("Літаковий Ударний"));
+        assert!(sheet.contains("ПТЗ Новостав"));
+        assert!(sheet.contains("старший майстер-сержант"));
+        assert!(!sheet.contains("<formula1>CrewStatuses</formula1>"));
+        assert!(!sheet.contains("<formula1>UavTypes</formula1>"));
+        assert!(!sheet.contains("<formula1>Locations</formula1>"));
+        assert!(!sheet.contains("<formula1>Ranks</formula1>"));
         assert!(!sheet.contains("COUNTA(M9:M11)"));
         assert!(sheet.contains("<c r=\"F7\" s=\"171\"><v>4</v></c>"));
-        assert!(sheet.contains("SUMPRODUCT(($Q$7:$Q$11=&quot;Екіпаж&quot;)"));
+        assert!(sheet.contains(
+            "SUMPRODUCT(IFERROR((($Q$7:$Q$11=&quot;Екіпаж&quot;)*($M$7:$M$11&lt;&gt;&quot;&quot;))/COUNTIFS("
+        ));
+        assert!(sheet.contains("$Q$7:$Q$11,&quot;Екіпаж&quot;),0))"));
         assert!(sheet.contains("Оперативне підпорядкування"));
         assert!(sheet.contains("$K$7:$K$11,&quot;*ТВО*&quot;"));
         assert!(sheet.contains("ЕКІПАЖ АЛЬФА"));
@@ -1450,10 +1429,9 @@ mod tests {
         assert!(sheet.contains("<col min=\"17\" max=\"17\" width=\"0\" hidden=\"1\""));
         assert!(sheet.contains("<mergeCell ref=\"A7:A9\"/>"));
         assert!(sheet.contains("$Q$7:$Q$11"));
-        assert!(dictionaries.contains("Літаковий Ударний"));
-        assert!(!dictionaries.contains("Реко та облаштування"));
-        assert!(dictionaries.contains("Реко"));
-        assert!(dictionaries.contains("Облаштування"));
+        assert!(!sheet.contains("Реко та облаштування"));
+        assert!(sheet.contains("Реко"));
+        assert!(sheet.contains("Облаштування"));
         assert!(!sheet.contains("ОСОБА-"));
         assert!(sheet.contains("<c r=\"E14\" s=\"5\""));
         assert!(sheet.contains("<c r=\"E15\" s=\"3\""));
@@ -1540,6 +1518,46 @@ mod tests {
     }
 
     #[test]
+    fn crew_formulas_handle_blank_rows_and_active_status_without_false_inactive_count() {
+        assert_eq!(crew_status_group("Активний"), "working");
+
+        let unique = unique_crew_count_formula(11);
+        assert_eq!(
+            unique,
+            "SUMPRODUCT(IFERROR((($Q$7:$Q$11=\"Екіпаж\")*($M$7:$M$11<>\"\"))/COUNTIFS($M$7:$M$11,$M$7:$M$11,$Q$7:$Q$11,\"Екіпаж\"),0))"
+        );
+
+        let (forming, working, inactive) = crew_status_formulas(11);
+        assert_eq!(
+            working,
+            "COUNTIF($H$7:$H$11,\"прац*\")+COUNTIF($H$7:$H$11,\"Активний\")"
+        );
+        assert_eq!(
+            inactive,
+            format!("COUNTIF($H$7:$H$11,\"<>\")-({forming})-({working})")
+        );
+        assert!(inactive.ends_with(&format!("-({working})")));
+    }
+
+    #[test]
+    fn inline_validations_fit_excel_limit_and_reject_oversized_sources() {
+        let schema = schema().unwrap();
+        assert!(inline_data_validation("A1", CREW_STATUSES.iter().copied(), "Помилка").is_ok());
+        assert!(inline_data_validation("A1", UAV_TYPES.iter().copied(), "Помилка").is_ok());
+        assert!(inline_data_validation("A1", RANKS.iter().copied(), "Помилка").is_ok());
+        assert!(inline_data_validation(
+            "A1",
+            schema.locations.iter().map(String::as_str),
+            "Помилка"
+        )
+        .is_ok());
+
+        let oversized = "а".repeat(254);
+        let error = inline_data_validation("A1", [oversized.as_str()], "Помилка").unwrap_err();
+        assert!(error.contains("255"));
+    }
+
+    #[test]
     fn exports_filled_bcs_and_keeps_personal_values_as_plain_text() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("filled.xlsx");
@@ -1567,6 +1585,77 @@ mod tests {
         assert!(sheet.contains("<c r=\"F7\" s=\"171\"><v>4</v></c>"));
     }
 
+    #[test]
+    fn exports_macro_free_one_sheet_bcs_without_helpers_and_keeps_nonzero_uav_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("one-sheet.xlsx");
+        export_filled(FilledBcsRequest {
+            unit_name: "1 РУБАК".into(),
+            report_date: "08.10.2026".into(),
+            structure_type: StructureType::Company,
+            authorized_strength: 5,
+            blocks: blocks(),
+            people: vec![PersonInput {
+                block_id: "crew-1".into(),
+                position: "Оператор".into(),
+                rank: "солдат".into(),
+                full_name: "іванов іван іванович".into(),
+                duties: "Оператор БпАК".into(),
+                location: "На позиції".into(),
+                note: "Тест".into(),
+            }],
+            output_path: path.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+
+        let content_types = read_entry(&path, "[Content_Types].xml");
+        let workbook = read_entry(&path, "xl/workbook.xml");
+        let relationships = read_entry(&path, "xl/_rels/workbook.xml.rels");
+        let bcs = read_entry(&path, "xl/worksheets/sheet1.xml");
+        let styles = read_entry(&path, "xl/styles.xml");
+        let names = entry_names(&path);
+
+        assert!(content_types.contains(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+        ));
+        assert!(!content_types.contains("sheet.macroEnabled.main+xml"));
+        assert!(!content_types.contains("vbaProject"));
+        assert!(!content_types.contains("activeX"));
+        assert!(!content_types.contains("vmlDrawing"));
+        assert!(!content_types.contains("/xl/worksheets/sheet2.xml"));
+        assert!(workbook.contains("<sheet name=\"БЧС\""));
+        assert!(!workbook.contains("Довідники"));
+        assert!(!workbook.contains("Аналітика"));
+        assert!(!workbook.contains("Фільтр за місцем"));
+        assert!(!workbook.contains("<definedNames>"));
+        assert_eq!(workbook.matches("<sheet ").count(), 1);
+        assert!(!relationships.contains("Target=\"worksheets/sheet2.xml\""));
+        assert!(!relationships.contains("vbaProject"));
+        assert!(!bcs.contains("<autoFilter"));
+        assert!(!bcs.contains("<sheetPr codeName="));
+        assert!(!bcs.contains("<legacyDrawing"));
+        assert!(!bcs.contains("<controls>"));
+        assert!(!bcs.contains("<hyperlinks>"));
+        assert!(!bcs.contains("<hyperlink "));
+        assert!(bcs.contains("Екіпажів — ФПВ"));
+        assert!(!bcs.contains("Екіпажів — Бомбер"));
+        assert!(bcs.contains(
+            "COUNTIF($H$7:$H$11,&quot;прац*&quot;)+COUNTIF($H$7:$H$11,&quot;Активний&quot;)"
+        ));
+        assert!(!bcs.contains("#DIV/0!"));
+        assert!(styles.contains("<cellXfs count=\"180\">"));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.starts_with("xl/worksheets/sheet"))
+                .count(),
+            1
+        );
+        assert!(!names.iter().any(|name| name == "xl/worksheets/sheet2.xml"));
+        assert!(!names.iter().any(|name| name == "xl/vbaProject.bin"));
+        assert!(!names.iter().any(|name| name.starts_with("xl/activeX/")));
+        assert!(!names.iter().any(|name| name.ends_with(".vml")));
+    }
     #[test]
     fn requires_the_management_block_for_company_and_platoon() {
         let directory = tempfile::tempdir().unwrap();
@@ -1626,5 +1715,23 @@ mod tests {
         })
         .unwrap_err();
         assert!(invalid_type.contains("Оберіть значення зі списку"));
+    }
+
+    #[test]
+    fn requires_macro_free_output_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("macro-enabled.xlsm");
+        let error = export_template(TemplateRequest {
+            unit_name: "ТЕСТ".into(),
+            report_date: "08.10.2026".into(),
+            structure_type: StructureType::Company,
+            authorized_strength: 5,
+            blocks: blocks(),
+            output_path: path.to_string_lossy().into_owned(),
+        })
+        .unwrap_err();
+
+        assert!(error.contains(".xlsx"));
+        assert!(!path.exists());
     }
 }

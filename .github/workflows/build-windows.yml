@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  verify:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -20,16 +20,45 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: npm ci
-      - run: npm run test:full
-      - name: Зібрати «Зведення БЧС»
-        run: npm run tauri:build:summary
-      - name: Зібрати «Шаблон БЧС»
-        run: npm run tauri:build:template
-      - name: Зібрати «Редактор БЧС»
-        run: npm run tauri:build:editor
+      - name: Перевірити «Зведення БЧС» і «Редактор БЧС»
+        run: npm run test:ci
+
+  build:
+    needs: verify
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - app: Summary
+            build_command: npm run tauri:build:summary
+            artifact_name: BCS-Windows-Summary
+          - app: Editor
+            build_command: npm run tauri:build:editor
+            artifact_name: BCS-Windows-Editor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - name: Зібрати ${{ matrix.app }}
+        run: ${{ matrix.build_command }}
+      - name: Підготувати EXE
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem "src-tauri/target/release/bundle/nsis" -Filter "*.exe" -File)
+          if ($installers.Count -ne 1) {
+            throw "Очікувався рівно один NSIS EXE, знайдено: $($installers.Count)"
+          }
+          New-Item -ItemType Directory -Path "windows-artifact" -Force | Out-Null
+          Copy-Item -LiteralPath $installers[0].FullName -Destination "windows-artifact/$($installers[0].Name)"
       - uses: actions/upload-artifact@v4
         with:
-          name: BCS-Windows-3-apps
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          name: ${{ matrix.artifact_name }}
+          path: windows-artifact/*.exe
           if-no-files-found: error
           retention-days: 14

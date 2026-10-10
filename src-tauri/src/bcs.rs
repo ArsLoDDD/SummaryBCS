@@ -4,9 +4,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
 };
-use zip::ZipArchive;
+use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
 #[derive(Debug, Clone, Deserialize)]
 struct Schema {
@@ -103,6 +104,60 @@ pub struct ExportRequest {
     output_path: String,
 }
 
+const ABSENT_LOCATIONS: [&str; 8] = [
+    "ВІДП",
+    "ЛІК",
+    "ВЛК",
+    "НАВЧ",
+    "ВІДР",
+    "Відкомандировані",
+    "СЗЧ",
+    "ПТЗ Новостав",
+];
+
+#[derive(Debug, Clone, PartialEq)]
+struct UnitAnalytics {
+    unit_name: String,
+    authorized: i64,
+    listed: i64,
+    present: i64,
+    staffing_percent: f64,
+    deficit: i64,
+    presence_percent: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AnalyticsData {
+    units: Vec<UnitAnalytics>,
+    absence_reasons: Vec<(String, i64)>,
+    crew_statuses: Vec<(String, i64)>,
+    crew_types: Vec<(String, i64)>,
+    locations: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone)]
+struct ChartSeries {
+    name: String,
+    value_column: String,
+    values: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ChartSpec {
+    title: String,
+    category_column: String,
+    first_row: usize,
+    last_row: usize,
+    categories: Vec<String>,
+    series: Vec<ChartSeries>,
+    horizontal: bool,
+    percent_axis: bool,
+    from_col: usize,
+    from_row: usize,
+    to_col: usize,
+    to_row: usize,
+}
+
 fn schema() -> Result<Schema, String> {
     serde_json::from_str(include_str!("../../src/shared/bcs-schema.json"))
         .map_err(|_| "Вбудована схема БЧС пошкоджена.".to_string())
@@ -128,7 +183,12 @@ fn authorized_strength_from_rows(
     authorized_row: &SheetRow,
     file_name: &str,
 ) -> Result<i64, String> {
-    let summary_value = cell(authorized_row, 6);
+    let label_column = authorized_row
+        .cells
+        .iter()
+        .position(|value| normalize(&value.value) == "по штату")
+        .ok_or_else(|| format!("«{file_name}»: у підсумку відсутнє значення «По штату»."))?;
+    let summary_value = cell(authorized_row, label_column + 1);
     if !summary_value.has_formula {
         return parse_integer(&summary_value.value, "Значення «По штату»");
     }
@@ -410,7 +470,11 @@ fn parse_file(path: &Path) -> Result<ParsedBcs, String> {
 
     let authorized_row = sheet_rows
         .iter()
-        .find(|row| normalize(&cell(row, 5).value) == "по штату")
+        .find(|row| {
+            row.cells
+                .iter()
+                .any(|value| normalize(&value.value) == "по штату")
+        })
         .ok_or_else(|| format!("«{file_name}»: у підсумку відсутнє значення «По штату»."))?;
     let authorized_strength =
         authorized_strength_from_rows(&sheet_rows, authorized_row, &file_name)?;
@@ -560,6 +624,169 @@ fn number_cell(column_index: usize, row: usize, value: i64, style: usize) -> Str
     )
 }
 
+fn decimal_cell(column_index: usize, row: usize, value: f64, style: usize) -> String {
+    format!(
+        "<c r=\"{}{row}\" s=\"{style}\"><v>{value:.1}</v></c>",
+        column(column_index)
+    )
+}
+
+fn crew_group_starts(units: &[ParsedBcs]) -> Vec<&BcsRow> {
+    let mut starts = Vec::new();
+    for unit in units {
+        let mut previous = "";
+        for row in &unit.rows {
+            if row.group_key != previous {
+                starts.push(row);
+                previous = &row.group_key;
+            }
+        }
+    }
+    starts
+}
+
+fn crew_status_group(status: &str) -> &'static str {
+    let normalized = status.to_lowercase().replace(' ', "");
+    if normalized.starts_with("форм") {
+        "forming"
+    } else if normalized.starts_with("прац") || normalized == "активний" {
+        "working"
+    } else {
+        "inactive"
+    }
+}
+
+fn analytics_data(units: &[ParsedBcs], locations: &[String]) -> Result<AnalyticsData, String> {
+    let all_personnel = units
+        .iter()
+        .flat_map(|unit| &unit.rows)
+        .filter(|row| !row.full_name.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    let mut unit_rows = Vec::with_capacity(units.len());
+    for unit in units {
+        let personnel = unit
+            .rows
+            .iter()
+            .filter(|row| !row.full_name.trim().is_empty())
+            .collect::<Vec<_>>();
+        let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
+        let temporary_acting = personnel
+            .iter()
+            .filter(|row| row.is_temporary && row.personnel_position.to_uppercase().contains("ТВО"))
+            .count() as i64;
+        let listed = own
+            .checked_add(temporary_acting)
+            .ok_or_else(|| "Чисельність підрозділу завелика.".to_string())?;
+        let present = personnel
+            .iter()
+            .filter(|row| !row.is_external && !ABSENT_LOCATIONS.contains(&row.location.as_str()))
+            .count() as i64;
+        let staffing_percent = if unit.authorized_strength > 0 {
+            listed as f64 * 100.0 / unit.authorized_strength as f64
+        } else {
+            0.0
+        };
+        let deficit = unit.authorized_strength.saturating_sub(listed).max(0);
+        let presence_percent = if listed > 0 {
+            present as f64 * 100.0 / listed as f64
+        } else {
+            0.0
+        };
+        unit_rows.push(UnitAnalytics {
+            unit_name: unit.unit_name.clone(),
+            authorized: unit.authorized_strength,
+            listed,
+            present,
+            staffing_percent,
+            deficit,
+            presence_percent,
+        });
+    }
+
+    let count_own_location = |location: &str| {
+        all_personnel
+            .iter()
+            .filter(|row| !row.is_external && row.location == location)
+            .count() as i64
+    };
+    let absence_reasons = [
+        ("Відпустка", "ВІДП"),
+        ("Лікування", "ЛІК"),
+        ("ВЛК", "ВЛК"),
+        ("Навчання", "НАВЧ"),
+        ("Відрядження", "ВІДР"),
+        ("Відкомандировані", "Відкомандировані"),
+        ("СЗЧ", "СЗЧ"),
+        ("ПТЗ Новостав", "ПТЗ Новостав"),
+    ]
+    .into_iter()
+    .filter_map(|(label, location)| {
+        let count = count_own_location(location);
+        (count > 0).then(|| (label.to_string(), count))
+    })
+    .collect::<Vec<_>>();
+
+    let crews = crew_group_starts(units)
+        .into_iter()
+        .filter(|row| row.section == "Екіпаж" && !row.crew_name.trim().is_empty())
+        .collect::<Vec<_>>();
+    let crew_statuses = [
+        ("Формуються", "forming"),
+        ("Працюючі", "working"),
+        ("Не активні", "inactive"),
+    ]
+    .into_iter()
+    .map(|(label, group)| {
+        (
+            label.to_string(),
+            crews
+                .iter()
+                .filter(|row| crew_status_group(&row.crew_status) == group)
+                .count() as i64,
+        )
+    })
+    .collect::<Vec<_>>();
+
+    let mut crew_type_counts = BTreeMap::<String, i64>::new();
+    for crew in &crews {
+        let kind = crew.uav_type.trim();
+        if !kind.is_empty() {
+            *crew_type_counts.entry(kind.to_string()).or_default() += 1;
+        }
+    }
+    let crew_types = crew_type_counts
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .collect::<Vec<_>>();
+
+    let mut location_counts = locations
+        .iter()
+        .filter_map(|location| {
+            let count = all_personnel
+                .iter()
+                .filter(|row| row.location == *location)
+                .count() as i64;
+            (count > 0).then(|| (location.clone(), count))
+        })
+        .collect::<Vec<_>>();
+    let unknown = all_personnel
+        .iter()
+        .filter(|row| !locations.contains(&row.location))
+        .count() as i64;
+    if unknown > 0 {
+        location_counts.push(("Не вказано / інше".into(), unknown));
+    }
+
+    Ok(AnalyticsData {
+        units: unit_rows,
+        absence_reasons,
+        crew_statuses,
+        crew_types,
+        locations: location_counts,
+    })
+}
+
 fn bcs_styles() -> String {
     let fills = [
         "D7E48D", "FDEADA", "E6B8B7", "CCC0DA", "C7BED0", "DBEEF4", "D7E4BD", "F2DCDB",
@@ -571,11 +798,14 @@ fn bcs_styles() -> String {
     let formats = (10..=18)
         .map(|fill| format!("<xf numFmtId=\"0\" fontId=\"7\" fillId=\"{fill}\" borderId=\"7\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\" applyAlignment=\"1\"><alignment horizontal=\"center\" vertical=\"center\" wrapText=\"1\"/></xf>"))
         .collect::<String>();
+    let extra_formats = format!(
+        "{formats}<xf numFmtId=\"0\" fontId=\"7\" fillId=\"0\" borderId=\"7\" xfId=\"0\" applyFont=\"1\" applyBorder=\"1\" applyAlignment=\"1\"><alignment horizontal=\"center\" vertical=\"center\" wrapText=\"1\"/></xf><xf numFmtId=\"0\" fontId=\"7\" fillId=\"0\" borderId=\"7\" xfId=\"0\" applyFont=\"1\" applyBorder=\"1\" applyAlignment=\"1\"><alignment horizontal=\"left\" vertical=\"center\" wrapText=\"1\"/></xf>"
+    );
     include_str!("../resources/bcs-reference-styles.xml")
         .replace("<fills count=\"10\">", "<fills count=\"19\">")
         .replace("</fills>", &format!("{fills}</fills>"))
-        .replace("<cellXfs count=\"171\">", "<cellXfs count=\"180\">")
-        .replace("</cellXfs>", &format!("{formats}</cellXfs>"))
+        .replace("<cellXfs count=\"171\">", "<cellXfs count=\"182\">")
+        .replace("</cellXfs>", &format!("{extra_formats}</cellXfs>"))
 }
 
 fn style_for(row: &BcsRow) -> usize {
@@ -671,6 +901,533 @@ fn write_unit_rows(
     Ok(())
 }
 
+fn insert_cell(
+    rows: &mut BTreeMap<usize, BTreeMap<usize, String>>,
+    row: usize,
+    column_index: usize,
+    cell_xml: String,
+) {
+    rows.entry(row).or_default().insert(column_index, cell_xml);
+}
+
+fn write_two_column_table(
+    rows: &mut BTreeMap<usize, BTreeMap<usize, String>>,
+    title: &str,
+    title_row: usize,
+    first_column: usize,
+    labels: &[(String, i64)],
+) {
+    insert_cell(
+        rows,
+        title_row,
+        first_column,
+        text_cell(first_column, title_row, title, 5),
+    );
+    insert_cell(
+        rows,
+        title_row,
+        first_column + 1,
+        text_cell(first_column + 1, title_row, "", 5),
+    );
+    let header_row = title_row + 1;
+    insert_cell(
+        rows,
+        header_row,
+        first_column,
+        text_cell(first_column, header_row, "Категорія", 3),
+    );
+    insert_cell(
+        rows,
+        header_row,
+        first_column + 1,
+        text_cell(first_column + 1, header_row, "Кількість", 3),
+    );
+    if labels.is_empty() {
+        let row = header_row + 1;
+        insert_cell(
+            rows,
+            row,
+            first_column,
+            text_cell(first_column, row, "Немає даних", 181),
+        );
+        insert_cell(
+            rows,
+            row,
+            first_column + 1,
+            text_cell(first_column + 1, row, "", 180),
+        );
+    } else {
+        for (offset, (label, value)) in labels.iter().enumerate() {
+            let row = header_row + offset + 1;
+            insert_cell(
+                rows,
+                row,
+                first_column,
+                text_cell(first_column, row, label, 181),
+            );
+            insert_cell(
+                rows,
+                row,
+                first_column + 1,
+                number_cell(first_column + 1, row, *value, 180),
+            );
+        }
+    }
+}
+
+fn build_analytics_sheet(
+    units: &[ParsedBcs],
+    locations: &[String],
+) -> Result<(String, Vec<ChartSpec>), String> {
+    let data = analytics_data(units, locations)?;
+    let mut rows = BTreeMap::<usize, BTreeMap<usize, String>>::new();
+    insert_cell(
+        &mut rows,
+        1,
+        0,
+        text_cell(
+            0,
+            1,
+            &format!("АНАЛІТИКА ЗВЕДЕНОГО БЧС СТАНОМ НА {}", units[0].date),
+            2,
+        ),
+    );
+    insert_cell(
+        &mut rows,
+        2,
+        0,
+        text_cell(
+            0,
+            2,
+            "Порівняння підрозділів за одну звітну дату. Це не динаміка в часі.",
+            5,
+        ),
+    );
+    insert_cell(
+        &mut rows,
+        4,
+        0,
+        text_cell(0, 4, "Чисельність за підрозділами", 5),
+    );
+    for (index, header) in [
+        "Підрозділ",
+        "По штату",
+        "По списку",
+        "В наявності",
+        "Укомплектованість, %",
+        "Дефіцит до штату",
+        "Наявність від списку, %",
+    ]
+    .iter()
+    .enumerate()
+    {
+        insert_cell(&mut rows, 5, index, text_cell(index, 5, header, 3));
+    }
+    for (offset, unit) in data.units.iter().enumerate() {
+        let row = 6 + offset;
+        insert_cell(&mut rows, row, 0, text_cell(0, row, &unit.unit_name, 181));
+        insert_cell(&mut rows, row, 1, number_cell(1, row, unit.authorized, 180));
+        insert_cell(&mut rows, row, 2, number_cell(2, row, unit.listed, 180));
+        insert_cell(&mut rows, row, 3, number_cell(3, row, unit.present, 180));
+        insert_cell(
+            &mut rows,
+            row,
+            4,
+            decimal_cell(4, row, unit.staffing_percent, 180),
+        );
+        insert_cell(&mut rows, row, 5, number_cell(5, row, unit.deficit, 180));
+        insert_cell(
+            &mut rows,
+            row,
+            6,
+            decimal_cell(6, row, unit.presence_percent, 180),
+        );
+    }
+    write_two_column_table(
+        &mut rows,
+        "Причини відсутності",
+        4,
+        8,
+        &data.absence_reasons,
+    );
+    write_two_column_table(&mut rows, "Статуси екіпажів", 4, 11, &data.crew_statuses);
+    write_two_column_table(
+        &mut rows,
+        "Типи БпАК (лише ненульові)",
+        4,
+        14,
+        &data.crew_types,
+    );
+    write_two_column_table(&mut rows, "Місця (лише ненульові)", 4, 17, &data.locations);
+
+    let mut sheet = String::from(
+        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheetViews><sheetView workbookViewId=\"0\"><pane ySplit=\"2\" topLeftCell=\"A3\" activePane=\"bottomLeft\" state=\"frozen\"/></sheetView></sheetViews><cols><col min=\"1\" max=\"1\" width=\"24\" customWidth=\"1\"/><col min=\"2\" max=\"7\" width=\"17\" customWidth=\"1\"/><col min=\"8\" max=\"8\" width=\"3\" customWidth=\"1\"/><col min=\"9\" max=\"9\" width=\"24\" customWidth=\"1\"/><col min=\"10\" max=\"10\" width=\"14\" customWidth=\"1\"/><col min=\"11\" max=\"11\" width=\"3\" customWidth=\"1\"/><col min=\"12\" max=\"12\" width=\"24\" customWidth=\"1\"/><col min=\"13\" max=\"13\" width=\"14\" customWidth=\"1\"/><col min=\"14\" max=\"14\" width=\"3\" customWidth=\"1\"/><col min=\"15\" max=\"15\" width=\"24\" customWidth=\"1\"/><col min=\"16\" max=\"16\" width=\"14\" customWidth=\"1\"/><col min=\"17\" max=\"17\" width=\"3\" customWidth=\"1\"/><col min=\"18\" max=\"18\" width=\"24\" customWidth=\"1\"/><col min=\"19\" max=\"19\" width=\"14\" customWidth=\"1\"/></cols><sheetData>",
+    );
+    for (row_number, cells) in &rows {
+        let height = match *row_number {
+            1 => 28,
+            5 => 34,
+            _ => 24,
+        };
+        sheet.push_str(&format!(
+            "<row r=\"{row_number}\" ht=\"{height}\" customHeight=\"1\">"
+        ));
+        for cell_xml in cells.values() {
+            sheet.push_str(cell_xml);
+        }
+        sheet.push_str("</row>");
+    }
+
+    let maximum_table_rows = [
+        data.units.len(),
+        data.absence_reasons.len().max(1),
+        data.crew_statuses.len(),
+        data.crew_types.len().max(1),
+        data.locations.len().max(1),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(1);
+    let top = 7 + maximum_table_rows;
+    let unit_first = 6;
+    let unit_last = 5 + data.units.len();
+    let categories = data
+        .units
+        .iter()
+        .map(|unit| unit.unit_name.clone())
+        .collect::<Vec<_>>();
+    let mut charts = vec![
+        ChartSpec {
+            title: "Штат, список і наявність за підрозділами".into(),
+            category_column: "A".into(),
+            first_row: unit_first,
+            last_row: unit_last,
+            categories: categories.clone(),
+            series: vec![
+                ChartSeries {
+                    name: "По штату".into(),
+                    value_column: "B".into(),
+                    values: data
+                        .units
+                        .iter()
+                        .map(|unit| unit.authorized as f64)
+                        .collect(),
+                },
+                ChartSeries {
+                    name: "По списку".into(),
+                    value_column: "C".into(),
+                    values: data.units.iter().map(|unit| unit.listed as f64).collect(),
+                },
+                ChartSeries {
+                    name: "В наявності".into(),
+                    value_column: "D".into(),
+                    values: data.units.iter().map(|unit| unit.present as f64).collect(),
+                },
+            ],
+            horizontal: false,
+            percent_axis: false,
+            from_col: 0,
+            from_row: top,
+            to_col: 8,
+            to_row: top + 16,
+        },
+        ChartSpec {
+            title: "Укомплектованість і наявність за підрозділами, %".into(),
+            category_column: "A".into(),
+            first_row: unit_first,
+            last_row: unit_last,
+            categories,
+            series: vec![
+                ChartSeries {
+                    name: "Укомплектованість, %".into(),
+                    value_column: "E".into(),
+                    values: data
+                        .units
+                        .iter()
+                        .map(|unit| unit.staffing_percent)
+                        .collect(),
+                },
+                ChartSeries {
+                    name: "Наявність від списку, %".into(),
+                    value_column: "G".into(),
+                    values: data
+                        .units
+                        .iter()
+                        .map(|unit| unit.presence_percent)
+                        .collect(),
+                },
+            ],
+            horizontal: true,
+            percent_axis: true,
+            from_col: 9,
+            from_row: top,
+            to_col: 17,
+            to_row: top + 16,
+        },
+    ];
+
+    let mut add_chart = |title: &str,
+                         category_column: &str,
+                         value_column: &str,
+                         values: &[(String, i64)],
+                         from_col: usize,
+                         from_row: usize,
+                         to_col: usize,
+                         to_row: usize| {
+        if values.is_empty() {
+            return;
+        }
+        charts.push(ChartSpec {
+            title: title.into(),
+            category_column: category_column.into(),
+            first_row: 6,
+            last_row: 5 + values.len(),
+            categories: values.iter().map(|(label, _)| label.clone()).collect(),
+            series: vec![ChartSeries {
+                name: "Кількість".into(),
+                value_column: value_column.into(),
+                values: values.iter().map(|(_, value)| *value as f64).collect(),
+            }],
+            horizontal: true,
+            percent_axis: false,
+            from_col,
+            from_row,
+            to_col,
+            to_row,
+        });
+    };
+    add_chart(
+        "Причини відсутності",
+        "I",
+        "J",
+        &data.absence_reasons,
+        0,
+        top + 17,
+        8,
+        top + 33,
+    );
+    add_chart(
+        "Статуси екіпажів",
+        "L",
+        "M",
+        &data.crew_statuses,
+        9,
+        top + 17,
+        17,
+        top + 33,
+    );
+    add_chart(
+        "Типи БпАК",
+        "O",
+        "P",
+        &data.crew_types,
+        0,
+        top + 34,
+        8,
+        top + 50,
+    );
+    add_chart(
+        "Де знаходиться особовий склад",
+        "R",
+        "S",
+        &data.locations,
+        9,
+        top + 34,
+        17,
+        top + 50,
+    );
+
+    sheet.push_str(
+        "</sheetData><mergeCells count=\"7\"><mergeCell ref=\"A1:S1\"/><mergeCell ref=\"A2:S2\"/><mergeCell ref=\"A4:G4\"/><mergeCell ref=\"I4:J4\"/><mergeCell ref=\"L4:M4\"/><mergeCell ref=\"O4:P4\"/><mergeCell ref=\"R4:S4\"/></mergeCells><pageMargins left=\"0.25\" right=\"0.25\" top=\"0.3\" bottom=\"0.3\" header=\"0\" footer=\"0\"/><pageSetup paperSize=\"8\" orientation=\"landscape\" fitToWidth=\"1\" fitToHeight=\"0\"/><drawing r:id=\"rIdDrawing\"/></worksheet>",
+    );
+    Ok((sheet, charts))
+}
+
+fn chart_xml(spec: &ChartSpec, chart_index: usize) -> String {
+    let category_formula = format!(
+        "'Аналітика'!${}${}:${}${}",
+        spec.category_column, spec.first_row, spec.category_column, spec.last_row
+    );
+    let category_cache = spec
+        .categories
+        .iter()
+        .enumerate()
+        .map(|(index, value)| format!("<c:pt idx=\"{index}\"><c:v>{}</c:v></c:pt>", esc(value)))
+        .collect::<String>();
+    let palette = ["2F75B5", "70AD47", "A5A5A5", "ED7D31", "5B9BD5"];
+    let series = spec
+        .series
+        .iter()
+        .enumerate()
+        .map(|(index, series)| {
+            let value_formula = format!(
+                "'Аналітика'!${}${}:${}${}",
+                series.value_column, spec.first_row, series.value_column, spec.last_row
+            );
+            let values = series
+                .values
+                .iter()
+                .enumerate()
+                .map(|(point, value)| {
+                    format!("<c:pt idx=\"{point}\"><c:v>{value:.4}</c:v></c:pt>")
+                })
+                .collect::<String>();
+            format!(
+                "<c:ser><c:idx val=\"{index}\"/><c:order val=\"{index}\"/><c:tx><c:v>{}</c:v></c:tx><c:spPr><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill><a:ln><a:noFill/></a:ln></c:spPr><c:cat><c:strRef><c:f>{}</c:f><c:strCache><c:ptCount val=\"{}\"/>{}</c:strCache></c:strRef></c:cat><c:val><c:numRef><c:f>{}</c:f><c:numCache><c:formatCode>0.0</c:formatCode><c:ptCount val=\"{}\"/>{}</c:numCache></c:numRef></c:val></c:ser>",
+                esc(&series.name),
+                palette[index % palette.len()],
+                category_formula,
+                spec.categories.len(),
+                category_cache,
+                value_formula,
+                series.values.len(),
+                values,
+            )
+        })
+        .collect::<String>();
+    let category_axis = 100_000 + chart_index * 2;
+    let value_axis = category_axis + 1;
+    let bar_direction = if spec.horizontal { "bar" } else { "col" };
+    let category_position = if spec.horizontal { "l" } else { "b" };
+    let value_position = if spec.horizontal { "b" } else { "l" };
+    let maximum = if spec.percent_axis {
+        "<c:max val=\"100\"/>"
+    } else {
+        ""
+    };
+    let major_unit = chart_major_unit(spec);
+    let legend = if spec.series.len() > 1 {
+        "<c:legend><c:legendPos val=\"t\"/><c:overlay val=\"0\"/></c:legend>"
+    } else {
+        ""
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><c:lang val=\"uk-UA\"/><c:roundedCorners val=\"0\"/><c:chart><c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"uk-UA\" sz=\"1100\" b=\"1\"><a:latin typeface=\"Arial\"/></a:rPr><a:t>{}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title><c:plotArea><c:layout/><c:barChart><c:barDir val=\"{bar_direction}\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/>{series}<c:dLbls><c:showLegendKey val=\"0\"/><c:showVal val=\"0\"/><c:showCatName val=\"0\"/><c:showSerName val=\"0\"/></c:dLbls><c:gapWidth val=\"120\"/><c:axId val=\"{category_axis}\"/><c:axId val=\"{value_axis}\"/></c:barChart><c:catAx><c:axId val=\"{category_axis}\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"{category_position}\"/><c:tickLblPos val=\"nextTo\"/><c:crossAx val=\"{value_axis}\"/><c:crosses val=\"autoZero\"/><c:auto val=\"1\"/><c:lblAlgn val=\"ctr\"/><c:lblOffset val=\"100\"/></c:catAx><c:valAx><c:axId val=\"{value_axis}\"/><c:scaling><c:orientation val=\"minMax\"/><c:min val=\"0\"/>{maximum}</c:scaling><c:delete val=\"0\"/><c:axPos val=\"{value_position}\"/><c:majorGridlines/><c:numFmt formatCode=\"0\" sourceLinked=\"0\"/><c:tickLblPos val=\"nextTo\"/><c:crossAx val=\"{category_axis}\"/><c:crosses val=\"autoZero\"/><c:crossBetween val=\"between\"/><c:majorUnit val=\"{major_unit}\"/></c:valAx></c:plotArea>{legend}<c:plotVisOnly val=\"1\"/><c:dispBlanksAs val=\"gap\"/><c:showDLblsOverMax val=\"0\"/></c:chart><c:spPr><a:solidFill><a:srgbClr val=\"FFFFFF\"/></a:solidFill><a:ln><a:solidFill><a:srgbClr val=\"D9D9D9\"/></a:solidFill></a:ln></c:spPr></c:chartSpace>",
+        esc(&spec.title)
+    )
+}
+
+fn chart_major_unit(spec: &ChartSpec) -> u64 {
+    if spec.percent_axis {
+        return 10;
+    }
+
+    let maximum_value = spec
+        .series
+        .iter()
+        .flat_map(|series| series.values.iter().copied())
+        .filter(|value| value.is_finite())
+        .fold(0.0_f64, f64::max);
+
+    count_chart_major_unit(maximum_value)
+}
+
+fn count_chart_major_unit(maximum_value: f64) -> u64 {
+    if maximum_value <= 10.0 {
+        1
+    } else if maximum_value <= 50.0 {
+        5
+    } else if maximum_value <= 100.0 {
+        10
+    } else if maximum_value <= 500.0 {
+        50
+    } else {
+        100
+    }
+}
+
+fn drawing_xml(charts: &[ChartSpec]) -> String {
+    let anchors = charts
+        .iter()
+        .enumerate()
+        .map(|(index, chart)| {
+            let id = index + 1;
+            format!(
+                "<xdr:twoCellAnchor><xdr:from><xdr:col>{}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>{}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{id}\" name=\"Chart {id}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rIdChart{id}\"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>",
+                chart.from_col, chart.from_row, chart.to_col, chart.to_row
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">{anchors}</xdr:wsDr>"
+    )
+}
+
+fn write_summary_package(
+    path: &Path,
+    bcs_sheet: &str,
+    analytics_sheet: &str,
+    charts: &[ChartSpec],
+    styles: &str,
+    theme: &str,
+) -> Result<(), String> {
+    let file = File::create(path).map_err(|_| "Не вдалося створити Excel-файл.".to_string())?;
+    let mut archive = ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let chart_overrides = (1..=charts.len())
+        .map(|index| format!("<Override PartName=\"/xl/drawings/charts/chart{index}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/>"))
+        .collect::<String>();
+    let content_types = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/><Override PartName=\"/xl/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/><Override PartName=\"/xl/drawings/drawing1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/>{chart_overrides}</Types>"
+    );
+    let root_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>";
+    let workbook_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet2.xml\"/><Relationship Id=\"rIdStyles\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/><Relationship Id=\"rIdTheme\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme\" Target=\"theme/theme1.xml\"/></Relationships>";
+    let workbook = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"БЧС\" sheetId=\"1\" r:id=\"rId1\"/><sheet name=\"Аналітика\" sheetId=\"2\" r:id=\"rId2\"/></sheets><calcPr calcId=\"191029\" fullCalcOnLoad=\"1\" forceFullCalc=\"1\"/></workbook>";
+    let sheet_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rIdDrawing\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/drawing1.xml\"/></Relationships>";
+    let drawing_relationships = (1..=charts.len())
+        .map(|index| format!("<Relationship Id=\"rIdChart{index}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" Target=\"charts/chart{index}.xml\"/>"))
+        .collect::<String>();
+    let drawing_rels = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{drawing_relationships}</Relationships>"
+    );
+    let fixed_files = [
+        ("[Content_Types].xml", content_types.as_str()),
+        ("_rels/.rels", root_rels),
+        ("xl/_rels/workbook.xml.rels", workbook_rels),
+        ("xl/workbook.xml", workbook),
+        ("xl/styles.xml", styles),
+        ("xl/theme/theme1.xml", theme),
+        ("xl/worksheets/sheet1.xml", bcs_sheet),
+        ("xl/worksheets/sheet2.xml", analytics_sheet),
+        ("xl/worksheets/_rels/sheet2.xml.rels", sheet_rels),
+    ];
+    for (name, content) in fixed_files {
+        archive
+            .start_file(name, options)
+            .map_err(|_| "Не вдалося сформувати Excel-файл.".to_string())?;
+        archive
+            .write_all(content.as_bytes())
+            .map_err(|_| "Не вдалося записати Excel-файл.".to_string())?;
+    }
+    archive
+        .start_file("xl/drawings/drawing1.xml", options)
+        .map_err(|_| "Не вдалося сформувати Excel-файл.".to_string())?;
+    archive
+        .write_all(drawing_xml(charts).as_bytes())
+        .map_err(|_| "Не вдалося записати Excel-файл.".to_string())?;
+    archive
+        .start_file("xl/drawings/_rels/drawing1.xml.rels", options)
+        .map_err(|_| "Не вдалося сформувати Excel-файл.".to_string())?;
+    archive
+        .write_all(drawing_rels.as_bytes())
+        .map_err(|_| "Не вдалося записати Excel-файл.".to_string())?;
+    for (index, chart) in charts.iter().enumerate() {
+        archive
+            .start_file(
+                format!("xl/drawings/charts/chart{}.xml", index + 1),
+                options,
+            )
+            .map_err(|_| "Не вдалося сформувати Excel-файл.".to_string())?;
+        archive
+            .write_all(chart_xml(chart, index + 1).as_bytes())
+            .map_err(|_| "Не вдалося записати Excel-файл.".to_string())?;
+    }
+    archive
+        .finish()
+        .map_err(|_| "Не вдалося завершити Excel-файл.".to_string())?;
+    Ok(())
+}
+
 fn export_workbook(path: &Path, units: &[ParsedBcs]) -> Result<(), String> {
     let schema = schema()?;
     let date = &units[0].date;
@@ -705,10 +1462,11 @@ fn export_workbook(path: &Path, units: &[ParsedBcs]) -> Result<(), String> {
     for unit in units {
         write_unit_rows(&mut sheet, &mut merges, unit, &mut cursor, &schema.widths)?;
     }
+    let data_end = cursor.saturating_sub(1);
     let summary = cursor + 2;
     write_summary(&mut sheet, summary, units, &schema.locations)?;
     sheet.push_str(&format!(
-        "</sheetData><mergeCells count=\"{}\">{}</mergeCells><pageMargins left=\"0.25\" right=\"0.25\" top=\"0.3\" bottom=\"0.3\" header=\"0\" footer=\"0\"/><pageSetup paperSize=\"8\" orientation=\"landscape\" fitToWidth=\"1\" fitToHeight=\"0\"/></worksheet>",
+        "</sheetData><autoFilter ref=\"A4:P{data_end}\"/><mergeCells count=\"{}\">{}</mergeCells><pageMargins left=\"0.25\" right=\"0.25\" top=\"0.3\" bottom=\"0.3\" header=\"0\" footer=\"0\"/><pageSetup paperSize=\"8\" orientation=\"landscape\" fitToWidth=\"1\" fitToHeight=\"0\"/></worksheet>",
         merges.len(),
         merges
             .iter()
@@ -716,10 +1474,12 @@ fn export_workbook(path: &Path, units: &[ParsedBcs]) -> Result<(), String> {
             .collect::<String>()
     ));
 
-    xlsx::write_styled_workbook(
+    let (analytics_sheet, charts) = build_analytics_sheet(units, &schema.locations)?;
+    write_summary_package(
         path,
-        "БЧС",
         &sheet,
+        &analytics_sheet,
+        &charts,
         &bcs_styles(),
         include_str!("../resources/bcs-reference-theme.xml"),
     )
@@ -737,16 +1497,6 @@ fn write_summary(
         .copied()
         .filter(|row| !row.full_name.trim().is_empty())
         .collect::<Vec<_>>();
-    let absent = [
-        "ВІДП",
-        "ЛІК",
-        "ВЛК",
-        "НАВЧ",
-        "ВІДР",
-        "Відкомандировані",
-        "СЗЧ",
-        "ПТЗ Новостав",
-    ];
     let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
     let count_own_location = |location: &str| {
         personnel
@@ -766,7 +1516,7 @@ fn write_summary(
         .count() as i64;
     let present = personnel
         .iter()
-        .filter(|row| !row.is_external && !absent.contains(&row.location.as_str()))
+        .filter(|row| !row.is_external && !ABSENT_LOCATIONS.contains(&row.location.as_str()))
         .count() as i64;
     let authorized = units.iter().try_fold(0i64, |total, unit| {
         total
@@ -810,19 +1560,8 @@ fn write_summary(
         temporary_acting,
     ];
 
-    let mut group_starts = Vec::new();
-    for unit in units {
-        let mut previous = "";
-        for row in &unit.rows {
-            if row.group_key != previous {
-                group_starts.push(row);
-                previous = &row.group_key;
-            }
-        }
-    }
-    let crews = group_starts
-        .iter()
-        .copied()
+    let crews = crew_group_starts(units)
+        .into_iter()
         .filter(|row| row.section == "Екіпаж" && !row.crew_name.is_empty())
         .collect::<Vec<_>>();
     let crew_personnel = personnel
@@ -846,18 +1585,9 @@ fn write_summary(
     functional.extend(
         crew_types
             .into_iter()
+            .filter(|(_, count)| *count > 0)
             .map(|(kind, count)| (format!("Екіпажів — {kind}"), count)),
     );
-    let status_group = |status: &str| {
-        let normalized = status.to_lowercase().replace(' ', "");
-        if normalized.starts_with("форм") {
-            "forming"
-        } else if normalized.starts_with("прац") || normalized == "активний" {
-            "working"
-        } else {
-            "inactive"
-        }
-    };
     for (label, group) in [
         ("Екіпажів — Формуються", "forming"),
         ("Екіпажів — Працюючі", "working"),
@@ -867,7 +1597,7 @@ fn write_summary(
             label.into(),
             crews
                 .iter()
-                .filter(|row| status_group(&row.crew_status) == group)
+                .filter(|row| crew_status_group(&row.crew_status) == group)
                 .count() as i64,
         ));
     }
@@ -888,7 +1618,7 @@ fn write_summary(
                 .iter()
                 .filter(|row| {
                     row.section == section
-                        && !absent.contains(&row.location.as_str())
+                        && !ABSENT_LOCATIONS.contains(&row.location.as_str())
                         && row.location != "ПТЗ Новостав"
                 })
                 .count() as i64,
@@ -944,6 +1674,7 @@ fn write_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     fn sample_unit(path: &Path, unit: &str, date: &str, authorized: i64) -> ParsedBcs {
         ParsedBcs {
@@ -983,6 +1714,29 @@ mod tests {
         let value_start = after_label.find("<v>").unwrap() + 3;
         let value_end = after_label[value_start..].find("</v>").unwrap() + value_start;
         after_label[value_start..value_end].parse().unwrap()
+    }
+
+    fn archive_text(archive: &mut ZipArchive<File>, path: &str) -> String {
+        let mut xml = String::new();
+        archive
+            .by_name(path)
+            .unwrap_or_else(|_| panic!("missing OOXML part: {path}"))
+            .read_to_string(&mut xml)
+            .unwrap();
+        xml
+    }
+
+    #[test]
+    fn chart_major_units_are_integer_steps_scaled_to_the_largest_value() {
+        assert_eq!(count_chart_major_unit(0.0), 1);
+        assert_eq!(count_chart_major_unit(10.0), 1);
+        assert_eq!(count_chart_major_unit(10.1), 5);
+        assert_eq!(count_chart_major_unit(50.0), 5);
+        assert_eq!(count_chart_major_unit(50.1), 10);
+        assert_eq!(count_chart_major_unit(100.0), 10);
+        assert_eq!(count_chart_major_unit(100.1), 50);
+        assert_eq!(count_chart_major_unit(500.0), 50);
+        assert_eq!(count_chart_major_unit(500.1), 100);
     }
 
     #[test]
@@ -1068,6 +1822,63 @@ mod tests {
     }
 
     #[test]
+    fn analytics_calculates_units_and_keeps_only_nonzero_types_and_locations() {
+        let path = PathBuf::from("analytics.xlsx");
+        let mut first = sample_unit(&path, "ПІДРОЗДІЛ А", "08.10.2026", 4);
+        first.rows.push(BcsRow {
+            group_key: "absent-a".into(),
+            section: "Управління роти".into(),
+            full_name: "ОСОБА-2".into(),
+            location: "ВІДП".into(),
+            ..BcsRow::default()
+        });
+        let mut second = sample_unit(&path, "ПІДРОЗДІЛ Б", "08.10.2026", 2);
+        second.rows[0].uav_type = "Бомбер".into();
+        second.rows[0].location = "ШТАБ".into();
+
+        let data = analytics_data(&[first, second], &["ПУ".into(), "ШТАБ".into()]).unwrap();
+
+        assert_eq!(data.units[0].authorized, 4);
+        assert_eq!(data.units[0].listed, 2);
+        assert_eq!(data.units[0].present, 1);
+        assert_eq!(data.units[0].staffing_percent, 50.0);
+        assert_eq!(data.units[0].deficit, 2);
+        assert_eq!(data.units[0].presence_percent, 50.0);
+        assert_eq!(data.units[1].staffing_percent, 50.0);
+        assert_eq!(data.units[1].deficit, 1);
+        assert_eq!(data.units[1].presence_percent, 100.0);
+        assert_eq!(
+            data.crew_types,
+            vec![("Бомбер".into(), 1), ("Коптер".into(), 1)]
+        );
+        assert!(!data
+            .crew_types
+            .iter()
+            .any(|(kind, count)| kind == "Літаковий ударний" || *count == 0));
+        assert_eq!(
+            data.locations,
+            vec![
+                ("ПУ".into(), 1),
+                ("ШТАБ".into(), 1),
+                ("Не вказано / інше".into(), 1)
+            ]
+        );
+        assert_eq!(data.absence_reasons, vec![("Відпустка".into(), 1)]);
+    }
+
+    #[test]
+    fn summary_omits_uav_types_that_have_no_crew() {
+        let path = PathBuf::from("zero-types.xlsx");
+        let unit = sample_unit(&path, "ПІДРОЗДІЛ", "08.10.2026", 4);
+        let mut xml = String::new();
+        write_summary(&mut xml, 100, &[unit], &["ПУ".into()]).unwrap();
+
+        assert!(xml.contains("Екіпажів — Коптер"));
+        assert!(!xml.contains("Екіпажів — Бомбер"));
+        assert!(!xml.contains("Екіпажів — Літаковий ударний"));
+    }
+
+    #[test]
     fn imports_an_anonymized_raportgen_shaped_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("unit-a.xlsx");
@@ -1126,6 +1937,11 @@ mod tests {
             has_formula: false,
         };
         let mut summary_cells = vec![Cell::default(); 7];
+        summary_cells[5] = Cell {
+            value: "По штату".into(),
+            style: None,
+            has_formula: false,
+        };
         summary_cells[6] = Cell {
             value: "0".into(),
             style: None,
@@ -1144,6 +1960,28 @@ mod tests {
 
         let value = authorized_strength_from_rows(&rows, &rows[1], "template.xlsx").unwrap();
         assert_eq!(value, 30);
+    }
+
+    #[test]
+    fn reads_authorized_strength_next_to_the_label_in_the_current_e_f_layout() {
+        let mut summary_cells = vec![Cell::default(); 6];
+        summary_cells[4] = Cell {
+            value: "По штату".into(),
+            style: None,
+            has_formula: false,
+        };
+        summary_cells[5] = Cell {
+            value: "42".into(),
+            style: None,
+            has_formula: false,
+        };
+        let rows = vec![SheetRow {
+            number: 510,
+            cells: summary_cells,
+        }];
+
+        let value = authorized_strength_from_rows(&rows, &rows[0], "editor.xlsx").unwrap();
+        assert_eq!(value, 42);
     }
 
     #[test]
@@ -1218,7 +2056,18 @@ mod tests {
     }
 
     #[test]
-    fn exports_units_in_requested_order_with_one_recalculated_summary() {
+    fn rejects_macro_enabled_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.xlsm");
+        std::fs::write(&path, b"not inspected because the extension is unsupported").unwrap();
+
+        let error = parse_file(&path).unwrap_err();
+
+        assert!(error.contains("підтримуються лише файли .xlsx"));
+    }
+
+    #[test]
+    fn exports_macro_free_summary_with_analytics_and_no_service_sheets() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("summary.xlsx");
         let units = [
@@ -1228,18 +2077,121 @@ mod tests {
         export_workbook(&path, &units).unwrap();
         let file = File::open(&path).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
-        let mut xml = String::new();
-        use std::io::Read;
-        archive
-            .by_name("xl/worksheets/sheet1.xml")
-            .unwrap()
-            .read_to_string(&mut xml)
-            .unwrap();
+        let xml = archive_text(&mut archive, "xl/worksheets/sheet1.xml");
         let first = xml.find("ТЕСТОВИЙ ПІДРОЗДІЛ Б").unwrap();
         let second = xml.find("ТЕСТОВИЙ ПІДРОЗДІЛ А").unwrap();
         assert!(first < second);
         assert_eq!(xml.matches("ЗВЕДЕНИЙ БЧС:").count(), 1);
         assert!(xml.contains(">22</v>"));
         assert!(!xml.contains("<f>"));
+        assert!(xml.contains("<autoFilter ref=\"A4:P"));
+        assert!(!xml.contains("<hyperlinks>"));
+        assert!(!xml.contains("<legacyDrawing "));
+        assert!(!xml.contains("<control "));
+        assert!(!xml.contains("LocationFilter"));
+
+        let workbook = archive_text(&mut archive, "xl/workbook.xml");
+        let bcs = workbook.find("name=\"БЧС\"").unwrap();
+        let analytics = workbook.find("name=\"Аналітика\"").unwrap();
+        assert!(bcs < analytics);
+        assert_eq!(workbook.matches("<sheet ").count(), 2);
+        assert!(!workbook.contains("Фільтр за місцем"));
+        assert!(!workbook.contains("Довідники"));
+        let workbook_rels = archive_text(&mut archive, "xl/_rels/workbook.xml.rels");
+        assert!(workbook_rels.contains("worksheets/sheet1.xml"));
+        assert!(workbook_rels.contains("worksheets/sheet2.xml"));
+        assert!(!workbook_rels.contains("vbaProject"));
+        assert!(!workbook_rels.contains("worksheets/sheet3.xml"));
+
+        let analytics_xml = archive_text(&mut archive, "xl/worksheets/sheet2.xml");
+        assert!(analytics_xml.contains("АНАЛІТИКА ЗВЕДЕНОГО БЧС"));
+        assert!(analytics_xml.contains("Це не динаміка в часі"));
+        assert!(analytics_xml.contains("По штату"));
+        assert!(analytics_xml.contains("Укомплектованість, %"));
+        assert!(analytics_xml.contains("Дефіцит до штату"));
+        assert!(analytics_xml.contains("Наявність від списку, %"));
+        assert!(analytics_xml.contains("Причини відсутності"));
+        assert!(analytics_xml.contains("Статуси екіпажів"));
+        assert!(analytics_xml.contains("Типи БпАК (лише ненульові)"));
+        assert!(analytics_xml.contains("Місця (лише ненульові)"));
+        assert!(analytics_xml.contains("<drawing r:id=\"rIdDrawing\"/>"));
+
+        let content_types = archive_text(&mut archive, "[Content_Types].xml");
+        assert!(content_types.contains("drawingml.chart+xml"));
+        assert!(!content_types.contains("/xl/worksheets/sheet3.xml"));
+        assert!(content_types.contains(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+        ));
+        assert!(!content_types.contains("macroEnabled"));
+        assert!(!content_types.contains("vbaProject"));
+        assert!(!content_types.contains("activeX"));
+        assert!(archive.by_name("xl/worksheets/sheet3.xml").is_err());
+
+        let drawing = archive_text(&mut archive, "xl/drawings/drawing1.xml");
+        assert_eq!(drawing.matches("<c:chart ").count(), 5);
+        let drawing_rels = archive_text(&mut archive, "xl/drawings/_rels/drawing1.xml.rels");
+        assert_eq!(drawing_rels.matches("relationships/chart").count(), 5);
+        let first_chart = archive_text(&mut archive, "xl/drawings/charts/chart1.xml");
+        assert!(first_chart.contains("Штат, список і наявність за підрозділами"));
+        assert!(first_chart.contains("'Аналітика'!$A$6:$A$7"));
+        assert!(first_chart.contains("'Аналітика'!$B$6:$B$7"));
+        assert!(first_chart.contains("'Аналітика'!$C$6:$C$7"));
+        assert!(first_chart.contains("'Аналітика'!$D$6:$D$7"));
+        assert!(first_chart.contains("<c:majorUnit val=\"5\"/>"));
+        let second_chart = archive_text(&mut archive, "xl/drawings/charts/chart2.xml");
+        assert!(second_chart.contains("'Аналітика'!$E$6:$E$7"));
+        assert!(second_chart.contains("'Аналітика'!$G$6:$G$7"));
+        assert!(second_chart.contains("<c:majorUnit val=\"10\"/>"));
+        let third_chart = archive_text(&mut archive, "xl/drawings/charts/chart3.xml");
+        assert!(third_chart.contains("<c:majorUnit val=\"1\"/>"));
+
+        let part_names = archive.file_names().map(str::to_string).collect::<Vec<_>>();
+        assert!(!part_names.iter().any(|name| name.contains("Довідники")));
+        assert!(!part_names.iter().any(|name| name.contains("activeX")));
+        assert!(!part_names.iter().any(|name| name.contains("vbaProject")));
+        assert!(!part_names.iter().any(|name| name.contains("vmlDrawing")));
+    }
+
+    #[test]
+    fn summary_export_rejects_macro_enabled_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("unit-a.xlsx");
+        let second_path = directory.path().join("unit-b.xlsx");
+        export_workbook(
+            &first_path,
+            &[sample_unit(
+                &first_path,
+                "ТЕСТОВИЙ ПІДРОЗДІЛ А",
+                "08.10.2026",
+                10,
+            )],
+        )
+        .unwrap();
+        export_workbook(
+            &second_path,
+            &[sample_unit(
+                &second_path,
+                "ТЕСТОВИЙ ПІДРОЗДІЛ Б",
+                "08.10.2026",
+                10,
+            )],
+        )
+        .unwrap();
+        let first = parse_file(&first_path).unwrap();
+        let second = parse_file(&second_path).unwrap();
+        let output_path = directory.path().join("summary.xlsm");
+
+        let error = export_request(ExportRequest {
+            paths: vec![
+                first_path.to_string_lossy().into_owned(),
+                second_path.to_string_lossy().into_owned(),
+            ],
+            unit_order: vec![first.id, second.id],
+            output_path: output_path.to_string_lossy().into_owned(),
+        })
+        .unwrap_err();
+
+        assert!(error.contains(".xlsx"));
+        assert!(!output_path.exists());
     }
 }

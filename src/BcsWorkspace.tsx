@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { ChevronDown, ChevronUp, Download, LoaderCircle, Plus, Trash2, Users } from "lucide-react";
 import CustomSelect, { type CustomSelectOption } from "./CustomSelect";
+import { crewTypeSummaryRows } from "./bcsSummary";
 import {
   BCS_HEADERS,
   BLOCK_TYPES,
@@ -339,10 +340,7 @@ export default function BcsWorkspace({ variant }: Props) {
     const functional: Array<[string, number]> = [
       ["Екіпажів (ос-загально)", uniqueCrewPersonnel],
       ["Екіпажів (загально)", crews.length],
-      ...SUMMARY_UAV_TYPES.map((uavType): [string, number] => [
-        `Екіпажів — ${uavType}`,
-        crews.filter((block) => block.uavType === uavType).length,
-      ]),
+      ...crewTypeSummaryRows(crews, SUMMARY_UAV_TYPES),
       ["Екіпажів — Формуються", crews.filter((block) => crewStatusGroup(block.status) === "forming").length],
       ["Екіпажів — Працюючі", crews.filter((block) => crewStatusGroup(block.status) === "working").length],
       ["Екіпажів — Не активні", crews.filter((block) => crewStatusGroup(block.status) === "inactive").length],
