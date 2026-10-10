@@ -64,7 +64,7 @@ npm run tauri:build:editor
 
 Вони створюють окремі виконувані файли `SummaryBCS.exe`, `BCSTemplateBuilder.exe` і `BCSEditor.exe`. Є також короткі команди `npm run build:exe:summary`, `npm run build:exe:template` і `npm run build:exe:editor`.
 
-У GitHub workflow **Windows EXE — ручна збірка** (`workflow_dispatch`) збирає лише «Зведення БЧС» і «Редактор БЧС». Після запуску доступні два окремі ZIP-артефакти: `BCS-Windows-Summary` і `BCS-Windows-Editor`; кожен містить один NSIS `.exe`. «Шаблон БЧС» у GitHub Actions поки не збирається. Push і pull request збирають Summary та Editor, а спільні автотести також перевіряють генератор Excel.
+У GitHub workflow **Windows EXE — збірка** автоматично запускається після кожного push у `main`; його також можна запустити вручну через `workflow_dispatch`. Він збирає лише «Зведення БЧС» і «Редактор БЧС». Після завершення доступні два окремі ZIP-артефакти: `BCS-Windows-Summary` і `BCS-Windows-Editor`; кожен містить один NSIS `.exe`. «Шаблон БЧС» у GitHub Actions поки не збирається. Pull request запускає лише перевірки без Windows-інсталяторів.
 
 ## Простий порядок роботи
 
