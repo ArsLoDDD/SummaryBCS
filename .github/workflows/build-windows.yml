@@ -1,0 +1,35 @@
+name: Windows EXE — ручна збірка
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: npm ci
+      - run: npm run test:full
+      - name: Зібрати «Зведення БЧС»
+        run: npm run tauri:build:summary
+      - name: Зібрати «Шаблон БЧС»
+        run: npm run tauri:build:template
+      - name: Зібрати «Редактор БЧС»
+        run: npm run tauri:build:editor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BCS-Windows-3-apps
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

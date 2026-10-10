@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Редактор БЧС",
+  "mainBinaryName": "BCSEditor",
+  "identifier": "ua.summarybcs.editor",
+  "build": {
+    "beforeDevCommand": "npm run dev:editor",
+    "beforeBuildCommand": "npm run build:editor"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Редактор БЧС",
+        "width": 1440,
+        "height": 900,
+        "maximized": true,
+        "minWidth": 940,
+        "minHeight": 680,
+        "backgroundColor": "#0b0d0a"
+      }
+    ]
+  }
+}

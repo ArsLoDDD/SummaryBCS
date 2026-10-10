@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Шаблон БЧС",
+  "mainBinaryName": "BCSTemplateBuilder",
+  "identifier": "ua.summarybcs.template",
+  "build": {
+    "beforeDevCommand": "npm run dev:template",
+    "beforeBuildCommand": "npm run build:template"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Шаблон БЧС",
+        "width": 1280,
+        "height": 860,
+        "maximized": true,
+        "minWidth": 940,
+        "minHeight": 680,
+        "backgroundColor": "#0b0d0a"
+      }
+    ]
+  }
+}
