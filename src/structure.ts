@@ -379,6 +379,9 @@ export function validateWorkspace(
   if (blocks.some((block) => !Number.isInteger(block.slots) || block.slots < 1 || block.slots > 2_000)) {
     return "У кожному блоці має бути від 1 до 2 000 місць.";
   }
+  if (totalSlots(blocks) > 20_000) {
+    return "Загальна кількість рядків у структурі не може перевищувати 20 000.";
+  }
   if (blocks.some((block) => block.kind === "crew" && !CREW_STATUSES.some((status) => status === block.status))) {
     return "Оберіть статус для кожного екіпажу.";
   }
@@ -391,9 +394,6 @@ export function validateWorkspace(
   }
   if (SINGLETON_BLOCK_KINDS.some((kind) => blocks.filter((block) => block.kind === kind).length > 1)) {
     return "Управління роти, управління взводу та блок «Інші» можна додати лише по одному.";
-  }
-  if (totalSlots(blocks) !== authorizedStrength) {
-    return "Кількість місць у структурі має дорівнювати кількості за штатом.";
   }
   return "";
 }

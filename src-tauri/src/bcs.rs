@@ -2,7 +2,7 @@ use crate::xlsx::{self, Cell, SheetRow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -70,6 +70,7 @@ struct ParsedBcs {
     file_name: String,
     unit_name: String,
     date: String,
+    is_summary: bool,
     authorized_strength: i64,
     rows: Vec<BcsRow>,
 }
@@ -102,6 +103,54 @@ pub struct ExportRequest {
     paths: Vec<String>,
     unit_order: Vec<String>,
     output_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComparisonRequest {
+    before_paths: Vec<String>,
+    after_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComparisonMetric {
+    label: String,
+    before: i64,
+    after: i64,
+    delta: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComparisonSection {
+    title: String,
+    rows: Vec<ComparisonMetric>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonnelChange {
+    kind: String,
+    person_name: String,
+    details: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComparisonResult {
+    scope: String,
+    title: String,
+    before_date: String,
+    after_date: String,
+    before_unit_count: usize,
+    after_unit_count: usize,
+    highlights: Vec<String>,
+    headline: Vec<ComparisonMetric>,
+    sections: Vec<ComparisonSection>,
+    unit_changes: Vec<String>,
+    personnel_changes: Vec<PersonnelChange>,
+    has_changes: bool,
 }
 
 const ABSENT_LOCATIONS: [&str; 8] = [
@@ -343,6 +392,7 @@ fn parse_file(path: &Path) -> Result<ParsedBcs, String> {
         .find(|row| row.number == 1)
         .map(|row| cell(row, 0).value.trim().to_string())
         .unwrap_or_default();
+    let is_summary = normalize(&title).starts_with("зведений бчс");
     let date = date_from_title(&title)
         .ok_or_else(|| format!("«{file_name}»: не вдалося визначити дату з заголовка БЧС."))?;
     let unit_row = sheet_rows
@@ -485,14 +535,19 @@ fn parse_file(path: &Path) -> Result<ParsedBcs, String> {
         file_name,
         unit_name,
         date,
+        is_summary,
         authorized_strength,
         rows,
     })
 }
 
-fn parse_collection(paths: &[PathBuf]) -> Result<Vec<ParsedBcs>, String> {
-    if paths.len() < 2 {
-        return Err("Оберіть щонайменше два файли БЧС.".into());
+fn parse_date_group(
+    paths: &[PathBuf],
+    minimum_files: usize,
+    empty_message: &str,
+) -> Result<Vec<ParsedBcs>, String> {
+    if paths.len() < minimum_files {
+        return Err(empty_message.into());
     }
     let mut parsed: Vec<ParsedBcs> = Vec::with_capacity(paths.len());
     let mut file_ids = HashSet::new();
@@ -525,6 +580,10 @@ fn parse_collection(paths: &[PathBuf]) -> Result<Vec<ParsedBcs>, String> {
         parsed.push(item);
     }
     Ok(parsed)
+}
+
+fn parse_collection(paths: &[PathBuf]) -> Result<Vec<ParsedBcs>, String> {
+    parse_date_group(paths, 2, "Оберіть щонайменше два файли БЧС.")
 }
 
 pub fn preview_files(paths: &[PathBuf]) -> Result<ImportPreview, String> {
@@ -596,6 +655,550 @@ pub fn export_request(request: ExportRequest) -> Result<String, String> {
     }
     export_workbook(&output, &ordered)?;
     Ok(output.to_string_lossy().into_owned())
+}
+
+#[derive(Debug, Clone, Default)]
+struct ComparisonPerson {
+    unit_name: String,
+    section: String,
+    rank: String,
+    position: String,
+    location: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ComparisonSnapshot {
+    authorized: i64,
+    listed: i64,
+    present: i64,
+    total_personnel: i64,
+    absences: BTreeMap<String, i64>,
+    crews: BTreeMap<String, i64>,
+    locations: BTreeMap<String, i64>,
+    people: BTreeMap<String, ComparisonPerson>,
+    units: BTreeMap<String, ComparisonUnitSnapshot>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ComparisonUnitSnapshot {
+    name: String,
+    authorized: Option<i64>,
+    listed: i64,
+    present: i64,
+}
+
+fn metric(label: impl Into<String>, before: i64, after: i64) -> ComparisonMetric {
+    ComparisonMetric {
+        label: label.into(),
+        before,
+        after,
+        delta: after - before,
+    }
+}
+
+fn snapshot(units: &[ParsedBcs], locations: &[String]) -> Result<ComparisonSnapshot, String> {
+    let mut result = ComparisonSnapshot::default();
+    let configured_locations = locations.iter().cloned().collect::<HashSet<_>>();
+
+    for unit in units {
+        result.authorized = result
+            .authorized
+            .checked_add(unit.authorized_strength)
+            .ok_or_else(|| "Сума штатної чисельності завелика.".to_string())?;
+
+        let personnel = unit
+            .rows
+            .iter()
+            .filter(|row| !row.full_name.trim().is_empty())
+            .collect::<Vec<_>>();
+        let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
+        let temporary_acting = personnel
+            .iter()
+            .filter(|row| row.is_temporary && row.personnel_position.to_uppercase().contains("ТВО"))
+            .count() as i64;
+        let listed = own
+            .checked_add(temporary_acting)
+            .ok_or_else(|| "Чисельність підрозділу завелика.".to_string())?;
+        let present = personnel
+            .iter()
+            .filter(|row| !row.is_external && !ABSENT_LOCATIONS.contains(&row.location.as_str()))
+            .count() as i64;
+
+        result.listed += listed;
+        result.present += present;
+        result.total_personnel += personnel.len() as i64;
+        if unit.is_summary {
+            let mut grouped = BTreeMap::<String, Vec<&BcsRow>>::new();
+            let mut current_unit_name = String::new();
+            for row in &unit.rows {
+                if !row.section.trim().is_empty()
+                    && row.values()[1..]
+                        .iter()
+                        .all(|value| value.trim().is_empty())
+                {
+                    current_unit_name = row.section.clone();
+                    continue;
+                }
+                if !current_unit_name.is_empty() {
+                    grouped
+                        .entry(current_unit_name.clone())
+                        .or_default()
+                        .push(row);
+                }
+            }
+            for (name, rows) in grouped {
+                let personnel = rows
+                    .into_iter()
+                    .filter(|row| !row.full_name.trim().is_empty())
+                    .collect::<Vec<_>>();
+                let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
+                let temporary_acting = personnel
+                    .iter()
+                    .filter(|row| {
+                        row.is_temporary && row.personnel_position.to_uppercase().contains("ТВО")
+                    })
+                    .count() as i64;
+                let present = personnel
+                    .iter()
+                    .filter(|row| {
+                        !row.is_external && !ABSENT_LOCATIONS.contains(&row.location.as_str())
+                    })
+                    .count() as i64;
+                result.units.insert(
+                    normalize(&name),
+                    ComparisonUnitSnapshot {
+                        name,
+                        authorized: None,
+                        listed: own + temporary_acting,
+                        present,
+                    },
+                );
+            }
+        } else {
+            result.units.insert(
+                normalize(&unit.unit_name),
+                ComparisonUnitSnapshot {
+                    name: unit.unit_name.clone(),
+                    authorized: Some(unit.authorized_strength),
+                    listed,
+                    present,
+                },
+            );
+        }
+
+        let mut current_unit_name = unit.unit_name.clone();
+        for row in &unit.rows {
+            if unit.is_summary
+                && !row.section.trim().is_empty()
+                && row.values()[1..]
+                    .iter()
+                    .all(|value| value.trim().is_empty())
+            {
+                current_unit_name = row.section.clone();
+                continue;
+            }
+            if row.full_name.trim().is_empty() {
+                continue;
+            }
+            let location = if configured_locations.contains(&row.location) {
+                row.location.clone()
+            } else {
+                "Не вказано / інше".into()
+            };
+            *result.locations.entry(location).or_default() += 1;
+            result
+                .people
+                .entry(normalize(&row.full_name))
+                .or_insert_with(|| ComparisonPerson {
+                    unit_name: current_unit_name.clone(),
+                    section: row.section.clone(),
+                    rank: row.rank.clone(),
+                    position: row.personnel_position.clone(),
+                    location: row.location.clone(),
+                });
+        }
+    }
+
+    let all_personnel = units
+        .iter()
+        .flat_map(|unit| &unit.rows)
+        .filter(|row| !row.full_name.trim().is_empty())
+        .collect::<Vec<_>>();
+    let count_own_location = |location: &str| {
+        all_personnel
+            .iter()
+            .filter(|row| !row.is_external && row.location == location)
+            .count() as i64
+    };
+    let temporary_acting = all_personnel
+        .iter()
+        .filter(|row| row.is_temporary && row.personnel_position.to_uppercase().contains("ТВО"))
+        .count() as i64;
+    for (label, count) in [
+        ("Відпустка", count_own_location("ВІДП")),
+        (
+            "Шпиталь",
+            count_own_location("ЛІК") + count_own_location("ВЛК"),
+        ),
+        (
+            "Відрядження",
+            count_own_location("НАВЧ") + count_own_location("ВІДР"),
+        ),
+        ("Відкомандировані", count_own_location("Відкомандировані")),
+        (
+            "Прикомандировані",
+            all_personnel
+                .iter()
+                .filter(|row| row.section == "Прикомандировані")
+                .count() as i64,
+        ),
+        (
+            "Оперативне підпорядкування",
+            all_personnel
+                .iter()
+                .filter(|row| row.section == "Оперативне підпорядкування")
+                .count() as i64,
+        ),
+        ("ПТЗ Новостав", count_own_location("ПТЗ Новостав")),
+        ("СЗЧ", count_own_location("СЗЧ")),
+        (
+            "Тимчасово прибулі",
+            all_personnel.iter().filter(|row| row.is_temporary).count() as i64,
+        ),
+        ("Тимчасово прибулі з ТВО", temporary_acting),
+    ] {
+        result.absences.insert(label.into(), count);
+    }
+
+    let crew_starts = crew_group_starts(units)
+        .into_iter()
+        .filter(|row| row.section == "Екіпаж" && !row.crew_name.trim().is_empty())
+        .collect::<Vec<_>>();
+    let crew_personnel = all_personnel
+        .iter()
+        .filter(|row| row.section == "Екіпаж")
+        .map(|row| normalize(&row.full_name))
+        .collect::<HashSet<_>>()
+        .len() as i64;
+    result
+        .crews
+        .insert("Особового складу в екіпажах".into(), crew_personnel);
+    result
+        .crews
+        .insert("Екіпажів загалом".into(), crew_starts.len() as i64);
+    for (label, group) in [
+        ("Формуються", "forming"),
+        ("Працюючі", "working"),
+        ("Не активні", "inactive"),
+    ] {
+        result.crews.insert(
+            label.into(),
+            crew_starts
+                .iter()
+                .filter(|row| crew_status_group(&row.crew_status) == group)
+                .count() as i64,
+        );
+    }
+    for crew in crew_starts {
+        let kind = crew.uav_type.trim();
+        if !kind.is_empty() {
+            *result
+                .crews
+                .entry(format!("Екіпажів — {kind}"))
+                .or_default() += 1;
+        }
+    }
+
+    Ok(result)
+}
+
+fn changed_map_rows(
+    before: &BTreeMap<String, i64>,
+    after: &BTreeMap<String, i64>,
+) -> Vec<ComparisonMetric> {
+    before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|label| {
+            let previous = *before.get(&label).unwrap_or(&0);
+            let current = *after.get(&label).unwrap_or(&0);
+            (previous != current).then(|| metric(label, previous, current))
+        })
+        .collect()
+}
+
+fn delta_phrase(label: &str, before: i64, after: i64) -> Option<String> {
+    let delta = after - before;
+    if delta == 0 {
+        None
+    } else if delta > 0 {
+        Some(format!(
+            "{label}: стало на {delta} більше ({before} → {after})."
+        ))
+    } else {
+        Some(format!(
+            "{label}: стало на {} менше ({before} → {after}).",
+            delta.unsigned_abs()
+        ))
+    }
+}
+
+fn comparison_personnel_changes(
+    before: &ComparisonSnapshot,
+    after: &ComparisonSnapshot,
+) -> Vec<PersonnelChange> {
+    let mut changes = Vec::new();
+    for (key, person) in &after.people {
+        if !before.people.contains_key(key) {
+            let details = format!(
+                "Додано: {} · {} · {}",
+                person.unit_name,
+                if person.rank.is_empty() {
+                    "звання не вказано"
+                } else {
+                    &person.rank
+                },
+                if person.location.is_empty() {
+                    "місце не вказано"
+                } else {
+                    &person.location
+                }
+            );
+            changes.push(PersonnelChange {
+                kind: "added".into(),
+                person_name: key.to_uppercase(),
+                details,
+            });
+        }
+    }
+    for (key, person) in &before.people {
+        if !after.people.contains_key(key) {
+            changes.push(PersonnelChange {
+                kind: "removed".into(),
+                person_name: key.to_uppercase(),
+                details: format!("Вибув: {} · {}", person.unit_name, person.location),
+            });
+        }
+    }
+    for (key, previous) in &before.people {
+        let Some(current) = after.people.get(key) else {
+            continue;
+        };
+        let mut details = Vec::new();
+        if previous.unit_name != current.unit_name {
+            details.push(format!(
+                "Підрозділ: {} → {}",
+                previous.unit_name, current.unit_name
+            ));
+        }
+        if previous.location != current.location {
+            let from = if previous.location.is_empty() {
+                "не вказано"
+            } else {
+                &previous.location
+            };
+            let to = if current.location.is_empty() {
+                "не вказано"
+            } else {
+                &current.location
+            };
+            details.push(format!("Де знаходиться: {from} → {to}"));
+        }
+        if previous.section != current.section {
+            details.push(format!("Блок: {} → {}", previous.section, current.section));
+        }
+        if previous.rank != current.rank {
+            details.push(format!("Звання: {} → {}", previous.rank, current.rank));
+        }
+        if previous.position != current.position {
+            details.push(format!(
+                "Посада: {} → {}",
+                previous.position, current.position
+            ));
+        }
+        if !details.is_empty() {
+            changes.push(PersonnelChange {
+                kind: "changed".into(),
+                person_name: key.to_uppercase(),
+                details: details.join("; "),
+            });
+        }
+    }
+    changes.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then(left.person_name.cmp(&right.person_name))
+    });
+    changes
+}
+
+fn compare_parsed(before: &[ParsedBcs], after: &[ParsedBcs]) -> Result<ComparisonResult, String> {
+    if before.is_empty() || after.is_empty() {
+        return Err("Додайте БЧС для обох дат.".into());
+    }
+    if before[0].date == after[0].date {
+        return Err("Для порівняння оберіть БЧС за дві різні дати.".into());
+    }
+    let before_summary = before.len() == 1 && before[0].is_summary;
+    let after_summary = after.len() == 1 && after[0].is_summary;
+    if before_summary != after_summary {
+        return Err(
+            "Порівнюйте однаковий формат: два БЧС одного підрозділу або два загальні БЧС.".into(),
+        );
+    }
+    let single_unit = before.len() == 1 && after.len() == 1 && !before_summary;
+    if single_unit && normalize(&before[0].unit_name) != normalize(&after[0].unit_name) {
+        return Err(format!(
+            "Для порівняння одного підрозділу оберіть той самий підрозділ за обидві дати: «{}» і «{}» не збігаються.",
+            before[0].unit_name, after[0].unit_name
+        ));
+    }
+    let duplicate = before
+        .iter()
+        .any(|left| after.iter().any(|right| left.id == right.id));
+    if duplicate {
+        return Err("Один і той самий файл не можна використати для обох дат.".into());
+    }
+
+    let schema = schema()?;
+    let previous = snapshot(before, &schema.locations)?;
+    let current = snapshot(after, &schema.locations)?;
+    let headline = vec![
+        metric("По штату", previous.authorized, current.authorized),
+        metric("По списку", previous.listed, current.listed),
+        metric("В наявності", previous.present, current.present),
+        metric(
+            "Усього людей у таблиці",
+            previous.total_personnel,
+            current.total_personnel,
+        ),
+    ];
+    let mut highlights = headline
+        .iter()
+        .filter_map(|row| delta_phrase(&row.label, row.before, row.after))
+        .collect::<Vec<_>>();
+    if highlights.is_empty() {
+        highlights.push("Основні показники не змінилися.".into());
+    }
+
+    let sections = [
+        (
+            "Причини відсутності",
+            changed_map_rows(&previous.absences, &current.absences),
+        ),
+        ("Екіпажі", changed_map_rows(&previous.crews, &current.crews)),
+        (
+            "Де знаходиться",
+            changed_map_rows(&previous.locations, &current.locations),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(title, rows)| {
+        (!rows.is_empty()).then(|| ComparisonSection {
+            title: title.into(),
+            rows,
+        })
+    })
+    .collect::<Vec<_>>();
+
+    let mut unit_changes = Vec::new();
+    for key in previous
+        .units
+        .keys()
+        .chain(current.units.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+    {
+        match (previous.units.get(&key), current.units.get(&key)) {
+            (None, Some(unit)) => {
+                let authorized = unit
+                    .authorized
+                    .map(|value| format!("по штату {value}, "))
+                    .unwrap_or_default();
+                unit_changes.push(format!(
+                    "Додано підрозділ «{}»: {authorized}по списку {}, в наявності {}.",
+                    unit.name, unit.listed, unit.present
+                ));
+            }
+            (Some(unit), None) => {
+                unit_changes.push(format!("Відсутній у новому БЧС підрозділ «{}».", unit.name))
+            }
+            (Some(old), Some(new)) => {
+                let mut parts = Vec::new();
+                if let (Some(old_authorized), Some(new_authorized)) =
+                    (old.authorized, new.authorized)
+                {
+                    if old_authorized != new_authorized {
+                        parts.push(format!("по штату {old_authorized} → {new_authorized}"));
+                    }
+                }
+                if old.listed != new.listed {
+                    parts.push(format!("по списку {} → {}", old.listed, new.listed));
+                }
+                if old.present != new.present {
+                    parts.push(format!("в наявності {} → {}", old.present, new.present));
+                }
+                if !parts.is_empty() {
+                    unit_changes.push(format!("{}: {}.", old.name, parts.join(", ")));
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    let personnel_changes = comparison_personnel_changes(&previous, &current);
+    let headline_changed = headline.iter().any(|row| row.delta != 0);
+    let has_changes = headline_changed
+        || !sections.is_empty()
+        || !unit_changes.is_empty()
+        || !personnel_changes.is_empty();
+    let title = if single_unit {
+        before[0].unit_name.clone()
+    } else {
+        "Загальний БЧС".into()
+    };
+
+    Ok(ComparisonResult {
+        scope: if single_unit { "unit" } else { "general" }.into(),
+        title,
+        before_date: before[0].date.clone(),
+        after_date: after[0].date.clone(),
+        before_unit_count: before.len(),
+        after_unit_count: after.len(),
+        highlights,
+        headline,
+        sections,
+        unit_changes,
+        personnel_changes,
+        has_changes,
+    })
+}
+
+pub fn compare_request(request: ComparisonRequest) -> Result<ComparisonResult, String> {
+    let before_paths = request
+        .before_paths
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let after_paths = request
+        .after_paths
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let before = parse_date_group(
+        &before_paths,
+        1,
+        "Додайте один або кілька файлів БЧС для першої дати.",
+    )?;
+    let after = parse_date_group(
+        &after_paths,
+        1,
+        "Додайте один або кілька файлів БЧС для другої дати.",
+    )?;
+    compare_parsed(&before, &after)
 }
 
 fn esc(text: &str) -> String {
@@ -1683,6 +2286,7 @@ mod tests {
             file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
             unit_name: unit.into(),
             date: date.into(),
+            is_summary: false,
             authorized_strength: authorized,
             rows: vec![BcsRow {
                 color_key: "crew-working".into(),
@@ -1864,6 +2468,156 @@ mod tests {
             ]
         );
         assert_eq!(data.absence_reasons, vec![("Відпустка".into(), 1)]);
+    }
+
+    #[test]
+    fn compares_one_unit_and_describes_personnel_and_location_changes() {
+        let path = PathBuf::from("comparison.xlsx");
+        let mut before = sample_unit(&path, "1 РУБАК", "08.10.2026", 3);
+        before.id = "before".into();
+        let mut after = sample_unit(&path, "1 РУБАК", "09.10.2026", 3);
+        after.id = "after".into();
+        after.rows[0].location = "ВІДП".into();
+        after.rows.push(BcsRow {
+            group_key: "management".into(),
+            section: "Управління роти".into(),
+            rank: "солдат".into(),
+            full_name: "ОСОБА-002".into(),
+            location: "ПУ".into(),
+            ..BcsRow::default()
+        });
+
+        let result = compare_parsed(&[before], &[after]).unwrap();
+
+        assert_eq!(result.scope, "unit");
+        assert_eq!(result.title, "1 РУБАК");
+        assert_eq!(result.before_date, "08.10.2026");
+        assert_eq!(result.after_date, "09.10.2026");
+        assert_eq!(
+            result
+                .headline
+                .iter()
+                .find(|row| row.label == "По списку")
+                .unwrap()
+                .delta,
+            1
+        );
+        assert_eq!(
+            result
+                .headline
+                .iter()
+                .find(|row| row.label == "В наявності")
+                .unwrap()
+                .delta,
+            0
+        );
+        assert!(result.sections.iter().any(|section| {
+            section.title == "Причини відсутності"
+                && section
+                    .rows
+                    .iter()
+                    .any(|row| row.label == "Відпустка" && row.delta == 1)
+        }));
+        assert!(result.personnel_changes.iter().any(|change| {
+            change.person_name == "ОСОБА-001"
+                && change.details.contains("Де знаходиться: ПУ → ВІДП")
+        }));
+        assert!(result
+            .personnel_changes
+            .iter()
+            .any(|change| { change.person_name == "ОСОБА-002" && change.kind == "added" }));
+    }
+
+    #[test]
+    fn compares_general_bcs_and_reports_added_and_removed_units() {
+        let path = PathBuf::from("general-comparison.xlsx");
+        let mut before_a = sample_unit(&path, "ПІДРОЗДІЛ А", "08.10.2026", 2);
+        before_a.id = "before-a".into();
+        let mut before_b = sample_unit(&path, "ПІДРОЗДІЛ Б", "08.10.2026", 2);
+        before_b.id = "before-b".into();
+        let mut after_a = sample_unit(&path, "ПІДРОЗДІЛ А", "09.10.2026", 2);
+        after_a.id = "after-a".into();
+        let mut after_c = sample_unit(&path, "ПІДРОЗДІЛ В", "09.10.2026", 4);
+        after_c.id = "after-c".into();
+
+        let result = compare_parsed(&[before_a, before_b], &[after_a, after_c]).unwrap();
+
+        assert_eq!(result.scope, "general");
+        assert_eq!(result.title, "Загальний БЧС");
+        assert!(result
+            .unit_changes
+            .iter()
+            .any(|change| change.contains("Відсутній у новому БЧС підрозділ «ПІДРОЗДІЛ Б»")));
+        assert!(result
+            .unit_changes
+            .iter()
+            .any(|change| change.contains("Додано підрозділ «ПІДРОЗДІЛ В»")));
+    }
+
+    #[test]
+    fn compares_two_exported_general_bcs_files_as_general_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let before_path = directory.path().join("general-before.xlsx");
+        let after_path = directory.path().join("general-after.xlsx");
+        export_workbook(
+            &before_path,
+            &[
+                sample_unit(&before_path, "ПІДРОЗДІЛ А", "08.10.2026", 2),
+                sample_unit(&before_path, "ПІДРОЗДІЛ Б", "08.10.2026", 3),
+            ],
+        )
+        .unwrap();
+        let after_a = sample_unit(&after_path, "ПІДРОЗДІЛ А", "09.10.2026", 2);
+        let mut after_b = sample_unit(&after_path, "ПІДРОЗДІЛ Б", "09.10.2026", 4);
+        after_b.rows.push(BcsRow {
+            group_key: "management-b".into(),
+            section: "Управління роти".into(),
+            rank: "солдат".into(),
+            full_name: "ОСОБА-002".into(),
+            location: "ПУ".into(),
+            ..BcsRow::default()
+        });
+        export_workbook(&after_path, &[after_a, after_b]).unwrap();
+
+        let before = parse_file(&before_path).unwrap();
+        let after = parse_file(&after_path).unwrap();
+        assert!(before.is_summary);
+        assert!(after.is_summary);
+
+        let result = compare_parsed(&[before], &[after]).unwrap();
+        assert_eq!(result.scope, "general");
+        assert_eq!(result.title, "Загальний БЧС");
+        assert_eq!(
+            result
+                .headline
+                .iter()
+                .find(|row| row.label == "По штату")
+                .unwrap()
+                .delta,
+            1
+        );
+        assert!(result
+            .unit_changes
+            .iter()
+            .any(|change| change.contains("ПІДРОЗДІЛ Б: по списку 1 → 2")));
+    }
+
+    #[test]
+    fn comparison_rejects_the_same_date_and_different_single_units() {
+        let path = PathBuf::from("invalid-comparison.xlsx");
+        let mut first = sample_unit(&path, "ПІДРОЗДІЛ А", "08.10.2026", 2);
+        first.id = "first".into();
+        let mut same_date = sample_unit(&path, "ПІДРОЗДІЛ А", "08.10.2026", 2);
+        same_date.id = "same-date".into();
+        assert!(compare_parsed(&[first.clone()], &[same_date])
+            .unwrap_err()
+            .contains("дві різні дати"));
+
+        let mut other_unit = sample_unit(&path, "ПІДРОЗДІЛ Б", "09.10.2026", 2);
+        other_unit.id = "other-unit".into();
+        assert!(compare_parsed(&[first], &[other_unit])
+            .unwrap_err()
+            .contains("той самий підрозділ"));
     }
 
     #[test]

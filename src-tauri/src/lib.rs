@@ -3,7 +3,7 @@ mod draft;
 mod generator;
 mod xlsx;
 
-use bcs::{ExportRequest, ImportPreview};
+use bcs::{ComparisonRequest, ComparisonResult, ExportRequest, ImportPreview};
 use generator::{FilledBcsRequest, TemplateRequest};
 use std::path::PathBuf;
 
@@ -16,6 +16,11 @@ fn import_bcs_files(paths: Vec<String>) -> Result<ImportPreview, String> {
 #[tauri::command]
 fn export_summary(request: ExportRequest) -> Result<String, String> {
     bcs::export_request(request)
+}
+
+#[tauri::command]
+fn compare_bcs_files(request: ComparisonRequest) -> Result<ComparisonResult, String> {
+    bcs::compare_request(request)
 }
 
 #[tauri::command]
@@ -49,6 +54,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             import_bcs_files,
             export_summary,
+            compare_bcs_files,
             export_bcs_template,
             export_filled_bcs,
             save_workspace_draft,

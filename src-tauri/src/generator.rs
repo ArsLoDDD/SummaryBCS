@@ -411,6 +411,11 @@ fn prepare(
         slots_total = slots_total
             .checked_add(block.slots)
             .ok_or_else(|| "Загальна кількість місць завелика.".to_string())?;
+        if slots_total > 20_000 {
+            return Err(
+                "Загальна кількість рядків у структурі не може перевищувати 20 000.".into(),
+            );
+        }
 
         let (status, uav_type) = if block.kind == BlockKind::Crew {
             let raw_status = block.status.as_deref().unwrap_or("").trim();
@@ -467,12 +472,6 @@ fn prepare(
         });
     }
     normalized_blocks.sort_by_key(|block| block_order(block.kind));
-    if slots_total != authorized_strength {
-        return Err(format!(
-            "Сума місць у структурі ({slots_total}) має дорівнювати чисельності за штатом ({authorized_strength})."
-        ));
-    }
-
     let block_indices = normalized_blocks
         .iter()
         .enumerate()
@@ -692,7 +691,7 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
             index + 1
         ));
     }
-    sheet.push_str("<col min=\"17\" max=\"17\" width=\"0\" hidden=\"1\" customWidth=\"1\"/></cols><sheetData><row r=\"1\" ht=\"18\" customHeight=\"1\">");
+    sheet.push_str("<col min=\"17\" max=\"18\" width=\"0\" hidden=\"1\" customWidth=\"1\"/></cols><sheetData><row r=\"1\" ht=\"18\" customHeight=\"1\">");
     sheet.push_str(&text_cell(
         0,
         1,
@@ -718,6 +717,7 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
     sheet.push_str("</row>");
 
     let mut crew_validation_cells = Vec::new();
+    let mut seen_crew_people = HashSet::new();
     for block in &request.blocks {
         let style = style_for(block);
         if block.slots > 1 {
@@ -767,6 +767,13 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
                 sheet.push_str(&text_cell(7, row, &block.status, style));
                 sheet.push_str(&text_cell(8, row, &block.uav_name, style));
                 sheet.push_str(&text_cell(9, row, &block.uav_type, style));
+            } else {
+                // Keep a styled cell in every merged row. Excel, Numbers and
+                // LibreOffice then render the vertical and bottom borders of
+                // A:J consistently instead of relying on merged-cell inference.
+                for column_index in 0..10 {
+                    sheet.push_str(&text_cell(column_index, row, "", style));
+                }
             }
             sheet.push_str(&text_cell(10, row, &person.position, style));
             sheet.push_str(&text_cell(11, row, &person.rank, style));
@@ -782,6 +789,22 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
             // Q is hidden and repeats the section on every personnel row so formulas
             // stay correct while A:J visually match the merged reference layout.
             sheet.push_str(&text_cell(16, row, &block.section, 0));
+            // R marks the first occurrence of every person in a crew. This
+            // keeps the visible summary formula simple and compatible with
+            // desktop Excel while still preventing duplicate P.I.B. counts.
+            let unique_crew_person = block.kind == BlockKind::Crew
+                && !person.full_name.is_empty()
+                && seen_crew_people.insert(person.full_name.to_uppercase());
+            let unique_formula = format!(
+                "IF(AND($Q{row}=\"Екіпаж\",$M{row}<>\"\"),IF(COUNTIFS($Q$7:$Q{row},\"Екіпаж\",$M$7:$M{row},$M{row})=1,1,0),0)"
+            );
+            sheet.push_str(&formula_cell(
+                17,
+                row,
+                &unique_formula,
+                i64::from(unique_crew_person),
+                0,
+            ));
             sheet.push_str("</row>");
         }
     }
@@ -958,17 +981,23 @@ fn crew_status_group(status: &str) -> &'static str {
 }
 
 fn crew_status_formulas(data_end: usize) -> (String, String, String) {
-    let forming = format!("COUNTIF($H$7:$H${data_end},\"форм*\")");
-    let working =
-        format!("COUNTIF($H$7:$H${data_end},\"прац*\")+COUNTIF($H$7:$H${data_end},\"Активний\")");
-    let inactive = format!("COUNTIF($H$7:$H${data_end},\"<>\")-({forming})-({working})");
+    let crew_count = crew_count_formula(data_end);
+    let forming = format!(
+        "COUNTIFS($Q$7:$Q${data_end},\"Екіпаж\",$E$7:$E${data_end},\"<>\",$H$7:$H${data_end},\"Формується\")"
+    );
+    let working = format!(
+        "COUNTIFS($Q$7:$Q${data_end},\"Екіпаж\",$E$7:$E${data_end},\"<>\",$H$7:$H${data_end},\"Працюючий\")+COUNTIFS($Q$7:$Q${data_end},\"Екіпаж\",$E$7:$E${data_end},\"<>\",$H$7:$H${data_end},\"Активний\")"
+    );
+    let inactive = format!("({crew_count})-({forming})-({working})");
     (forming, working, inactive)
 }
 
-fn unique_crew_count_formula(data_end: usize) -> String {
-    format!(
-        "SUMPRODUCT(IFERROR((($Q$7:$Q${data_end}=\"Екіпаж\")*($M$7:$M${data_end}<>\"\"))/COUNTIFS($M$7:$M${data_end},$M$7:$M${data_end},$Q$7:$Q${data_end},\"Екіпаж\"),0))"
-    )
+fn crew_count_formula(data_end: usize) -> String {
+    format!("COUNTIFS($Q$7:$Q${data_end},\"Екіпаж\",$E$7:$E${data_end},\"<>\")")
+}
+
+fn crew_personnel_formula(data_end: usize) -> String {
+    format!("SUM($R$7:$R${data_end})")
 }
 
 fn write_summary(
@@ -1152,7 +1181,8 @@ fn write_summary(
         .map(|(_, person)| person.full_name.to_uppercase())
         .collect::<HashSet<_>>()
         .len() as i64;
-    let unique_crew_formula = unique_crew_count_formula(data_end);
+    let crew_personnel_formula = crew_personnel_formula(data_end);
+    let crew_count_formula = crew_count_formula(data_end);
     let total_crews = request
         .blocks
         .iter()
@@ -1177,12 +1207,12 @@ fn write_summary(
     let mut functional = vec![
         (
             "Екіпажів (ос-загально)".to_string(),
-            unique_crew_formula,
+            crew_personnel_formula,
             unique_crew_personnel,
         ),
         (
             "Екіпажів (загально)".to_string(),
-            format!("COUNTIF($H$7:$H${data_end},\"<>\")"),
+            crew_count_formula,
             total_crews,
         ),
     ];
@@ -1197,7 +1227,10 @@ fn write_summary(
         }
         functional.push((
             format!("Екіпажів — {uav_type}"),
-            format!("COUNTIF($J$7:$J${data_end},\"{}\")", formula_text(uav_type)),
+            format!(
+                "COUNTIFS($Q$7:$Q${data_end},\"Екіпаж\",$E$7:$E${data_end},\"<>\",$J$7:$J${data_end},\"{}\")",
+                formula_text(uav_type)
+            ),
             crew_count,
         ));
     }
@@ -1406,10 +1439,8 @@ mod tests {
         assert!(!sheet.contains("<formula1>Ranks</formula1>"));
         assert!(!sheet.contains("COUNTA(M9:M11)"));
         assert!(sheet.contains("<c r=\"F7\" s=\"171\"><v>4</v></c>"));
-        assert!(sheet.contains(
-            "SUMPRODUCT(IFERROR((($Q$7:$Q$11=&quot;Екіпаж&quot;)*($M$7:$M$11&lt;&gt;&quot;&quot;))/COUNTIFS("
-        ));
-        assert!(sheet.contains("$Q$7:$Q$11,&quot;Екіпаж&quot;),0))"));
+        assert!(sheet.contains("SUM($R$7:$R$11)"));
+        assert!(sheet.contains("COUNTIFS($Q$7:$Q7,&quot;Екіпаж&quot;,$M$7:$M7,$M7)"));
         assert!(sheet.contains("Оперативне підпорядкування"));
         assert!(sheet.contains("$K$7:$K$11,&quot;*ТВО*&quot;"));
         assert!(sheet.contains("ЕКІПАЖ АЛЬФА"));
@@ -1426,8 +1457,10 @@ mod tests {
         assert!(styles.contains("<fgColor rgb=\"FFFDEADA\"/><bgColor rgb=\"FFFDEADA\"/>"));
         assert!(!styles.contains("<fgColor rgb=\"FFD7E48D\"/><bgColor rgb=\"FF000000\"/>"));
         assert!(!sheet.contains("ТЕСТОВИЙ ПІДРОЗДІЛ (Рота)"));
-        assert!(sheet.contains("<col min=\"17\" max=\"17\" width=\"0\" hidden=\"1\""));
+        assert!(sheet.contains("<col min=\"17\" max=\"18\" width=\"0\" hidden=\"1\""));
         assert!(sheet.contains("<mergeCell ref=\"A7:A9\"/>"));
+        assert!(sheet.contains("<c r=\"A8\" s=\"171\""));
+        assert!(sheet.contains("<c r=\"J9\" s=\"171\""));
         assert!(sheet.contains("$Q$7:$Q$11"));
         assert!(!sheet.contains("Реко та облаштування"));
         assert!(sheet.contains("Реко"));
@@ -1521,20 +1554,20 @@ mod tests {
     fn crew_formulas_handle_blank_rows_and_active_status_without_false_inactive_count() {
         assert_eq!(crew_status_group("Активний"), "working");
 
-        let unique = unique_crew_count_formula(11);
+        assert_eq!(crew_personnel_formula(11), "SUM($R$7:$R$11)");
         assert_eq!(
-            unique,
-            "SUMPRODUCT(IFERROR((($Q$7:$Q$11=\"Екіпаж\")*($M$7:$M$11<>\"\"))/COUNTIFS($M$7:$M$11,$M$7:$M$11,$Q$7:$Q$11,\"Екіпаж\"),0))"
+            crew_count_formula(11),
+            "COUNTIFS($Q$7:$Q$11,\"Екіпаж\",$E$7:$E$11,\"<>\")"
         );
 
         let (forming, working, inactive) = crew_status_formulas(11);
         assert_eq!(
             working,
-            "COUNTIF($H$7:$H$11,\"прац*\")+COUNTIF($H$7:$H$11,\"Активний\")"
+            "COUNTIFS($Q$7:$Q$11,\"Екіпаж\",$E$7:$E$11,\"<>\",$H$7:$H$11,\"Працюючий\")+COUNTIFS($Q$7:$Q$11,\"Екіпаж\",$E$7:$E$11,\"<>\",$H$7:$H$11,\"Активний\")"
         );
         assert_eq!(
             inactive,
-            format!("COUNTIF($H$7:$H$11,\"<>\")-({forming})-({working})")
+            format!("({})-({forming})-({working})", crew_count_formula(11))
         );
         assert!(inactive.ends_with(&format!("-({working})")));
     }
@@ -1639,9 +1672,7 @@ mod tests {
         assert!(!bcs.contains("<hyperlink "));
         assert!(bcs.contains("Екіпажів — ФПВ"));
         assert!(!bcs.contains("Екіпажів — Бомбер"));
-        assert!(bcs.contains(
-            "COUNTIF($H$7:$H$11,&quot;прац*&quot;)+COUNTIF($H$7:$H$11,&quot;Активний&quot;)"
-        ));
+        assert!(bcs.contains("COUNTIFS($Q$7:$Q$11,&quot;Екіпаж&quot;,$E$7:$E$11,&quot;&lt;&gt;&quot;,$H$7:$H$11,&quot;Працюючий&quot;)"));
         assert!(!bcs.contains("#DIV/0!"));
         assert!(styles.contains("<cellXfs count=\"180\">"));
         assert_eq!(
@@ -1689,10 +1720,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mismatched_staffing_and_unknown_dropdown_values() {
+    fn accepts_nominal_staffing_independent_from_rows_and_rejects_unknown_dropdown_values() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("invalid.xlsx");
-        let mismatch = export_template(TemplateRequest {
+        export_template(TemplateRequest {
             unit_name: "ТЕСТ".into(),
             report_date: "08.10.2026".into(),
             structure_type: StructureType::Company,
@@ -1700,8 +1731,8 @@ mod tests {
             blocks: blocks(),
             output_path: path.to_string_lossy().into_owned(),
         })
-        .unwrap_err();
-        assert!(mismatch.contains("має дорівнювати"));
+        .unwrap();
+        assert!(path.exists());
 
         let mut invalid_blocks = blocks();
         invalid_blocks[1].uav_type = Some("Невідомий тип".into());

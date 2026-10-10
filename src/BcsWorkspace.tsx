@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { ChevronDown, ChevronUp, Download, LoaderCircle, Plus, Trash2, Users } from "lucide-react";
+import { ChevronDown, ChevronUp, Download, LoaderCircle, Minus, Plus, Trash2, Users } from "lucide-react";
 import CustomSelect, { type CustomSelectOption } from "./CustomSelect";
 import { crewTypeSummaryRows } from "./bcsSummary";
 import {
@@ -136,6 +136,7 @@ const SUMMARY_UAV_TYPES = [
   "ФПВ",
   "ФПВ Перехоплювач",
 ] as const;
+const TABLE_ZOOM_STEPS = [50, 60, 70, 80, 90, 100, 110, 125] as const;
 type CrewStatusGroup = "forming" | "working" | "inactive";
 
 function crewStatusGroup(status: string): CrewStatusGroup {
@@ -270,6 +271,7 @@ export default function BcsWorkspace({ variant }: Props) {
   const [donePath, setDonePath] = useState("");
   const [draftReady, setDraftReady] = useState(false);
   const [draftStatus, setDraftStatus] = useState<"saved" | "saving" | "error">("saved");
+  const [tableZoom, setTableZoom] = useState(80);
 
   const places = useMemo(() => totalSlots(blocks), [blocks]);
   const people = useMemo(() => peopleForExport(blocks, peopleBySlot), [blocks, peopleBySlot]);
@@ -387,6 +389,17 @@ export default function BcsWorkspace({ variant }: Props) {
   const uavOptions = UAV_TYPES.map((value) => ({ value, label: value }));
   const rankOptions = RANKS.map((value) => ({ value, label: value }));
   const locationOptions = LOCATIONS.map((value) => ({ value, label: value }));
+
+  function changeTableZoom(direction: -1 | 1) {
+    const currentIndex = TABLE_ZOOM_STEPS.findIndex((value) => value === tableZoom);
+    const fallbackIndex = TABLE_ZOOM_STEPS.findIndex((value) => value >= tableZoom);
+    const baseIndex = currentIndex >= 0 ? currentIndex : Math.max(0, fallbackIndex);
+    const nextIndex = Math.min(
+      TABLE_ZOOM_STEPS.length - 1,
+      Math.max(0, baseIndex + direction),
+    );
+    setTableZoom(TABLE_ZOOM_STEPS[nextIndex]);
+  }
 
   useEffect(() => {
     if (!tauriAvailable) {
@@ -655,9 +668,33 @@ export default function BcsWorkspace({ variant }: Props) {
                 );
               })}
             </div>
+            <div className="bcs-zoom-control" aria-label="Масштаб таблиці">
+              <span>Масштаб</span>
+              <button
+                type="button"
+                aria-label="Зменшити масштаб таблиці"
+                onClick={() => changeTableZoom(-1)}
+                disabled={tableZoom === TABLE_ZOOM_STEPS[0]}
+              >
+                <Minus size={15} aria-hidden="true" />
+              </button>
+              <output aria-live="polite">{tableZoom}%</output>
+              <button
+                type="button"
+                aria-label="Збільшити масштаб таблиці"
+                onClick={() => changeTableZoom(1)}
+                disabled={tableZoom === TABLE_ZOOM_STEPS[TABLE_ZOOM_STEPS.length - 1]}
+              >
+                <Plus size={15} aria-hidden="true" />
+              </button>
+            </div>
           </div>
 
           <div className="bcs-table-scroll">
+            <div
+              className="bcs-table-scale"
+              style={{ "--bcs-table-zoom": tableZoom / 100 } as CSSProperties}
+            >
             <table className="bcs-editor-table">
               <BcsColGroup />
               <thead>
@@ -905,15 +942,14 @@ export default function BcsWorkspace({ variant }: Props) {
                 ))}
               </tbody>
             </table>
+            </div>
           </div>
         </section>
 
         <footer className="export-bar">
           <div>
             <b>{exportUnavailableReason ? "Експорт недоступний" : "Готово до експорту"}</b>
-            <span className={places === authorizedStrength ? "" : "count-warning"}>
-              {places} рядків · {authorizedStrength} за штатом{places === authorizedStrength ? "" : " — значення мають збігатися"}
-            </span>
+            <span>{places} рядків у структурі · {authorizedStrength} за штатом (довідково)</span>
             {exportUnavailableReason && <span className="count-warning">{exportUnavailableReason}</span>}
             {tauriAvailable && (
               <span className={draftStatus === "error" ? "autosave-error" : "autosave-status"}>
@@ -1261,9 +1297,7 @@ export default function BcsWorkspace({ variant }: Props) {
       <footer className="export-bar">
         <div>
           <b>{exportUnavailableReason ? "Експорт недоступний" : isEditor ? "Готово до експорту" : "Шаблон буде з формулами та списками"}</b>
-          <span className={places === authorizedStrength ? "" : "count-warning"}>
-            {places} місць · {authorizedStrength} за штатом{places === authorizedStrength ? "" : " — значення мають збігатися"}
-          </span>
+          <span>{places} місць у структурі · {authorizedStrength} за штатом (довідково)</span>
           {exportUnavailableReason && <span className="count-warning">{exportUnavailableReason}</span>}
           {tauriAvailable && (
             <span className={draftStatus === "error" ? "autosave-error" : "autosave-status"}>

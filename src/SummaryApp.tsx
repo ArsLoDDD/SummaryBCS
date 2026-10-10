@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -6,10 +6,20 @@ import {
   ArrowDown,
   ArrowUp,
   FileSpreadsheet,
+  GitCompareArrows,
   GripVertical,
   LoaderCircle,
+  X,
 } from "lucide-react";
-import { type ImportPreview, moveUnit } from "./model";
+import {
+  type ComparisonMetric,
+  type ComparisonResult,
+  type ImportPreview,
+  moveUnit,
+} from "./model";
+
+type AppTab = "summary" | "comparison";
+type ComparisonSide = "before" | "after";
 
 function messageFrom(error: unknown): string {
   if (typeof error === "string") return error;
@@ -17,7 +27,15 @@ function messageFrom(error: unknown): string {
   return "Сталася неочікувана помилка.";
 }
 
-export default function SummaryApp() {
+function fileName(path: string): string {
+  return path.replaceAll("\\", "/").split("/").at(-1) ?? path;
+}
+
+function Notification({ kind, children }: { kind: "error" | "success"; children: ReactNode }) {
+  return <div className={`message ${kind}`} role={kind === "error" ? "alert" : "status"}>{children}</div>;
+}
+
+function SummaryWorkflow({ active }: { active: boolean }) {
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -51,14 +69,13 @@ export default function SummaryApp() {
       title: "Оберіть файли БЧС",
     });
     if (!selected) return;
-    const paths = Array.isArray(selected) ? selected : [selected];
-    await importPaths(paths);
+    await importPaths(Array.isArray(selected) ? selected : [selected]);
   }
 
   useEffect(() => {
+    if (!active) return;
     let disposed = false;
     let stopListening: (() => void) | undefined;
-
     try {
       getCurrentWebviewWindow()
         .onDragDropEvent((event) => {
@@ -76,18 +93,15 @@ export default function SummaryApp() {
           if (disposed) unlisten();
           else stopListening = unlisten;
         })
-        .catch(() => {
-          // У браузерному перегляді лишається звичайна кнопка вибору файлів.
-        });
+        .catch(() => undefined);
     } catch {
       // У браузерному перегляді API вікна Tauri недоступне.
     }
-
     return () => {
       disposed = true;
       stopListening?.();
     };
-  }, [busy, importPaths, preview]);
+  }, [active, busy, importPaths, preview]);
 
   useEffect(() => {
     if (!error) return;
@@ -136,22 +150,15 @@ export default function SummaryApp() {
   }
 
   return (
-    <main className="app-shell summary-shell">
-      <header className="app-header">
-        <div>
-          <h1>Зведення БЧС</h1>
-          <p>Об’єднання XLSX-файлів підрозділів в один звіт</p>
-        </div>
-      </header>
-
-      {error && <div className="message error" role="alert">{error}</div>}
-      {donePath && <div className="message success" role="status">Файл збережено: {donePath}</div>}
+    <>
+      {error && <Notification kind="error">{error}</Notification>}
+      {donePath && <Notification kind="success">Файл збережено: {donePath}</Notification>}
 
       {!preview ? (
         <section className={`empty-panel${isDraggingFiles ? " dragging" : ""}`}>
           <FileSpreadsheet size={40} aria-hidden="true" />
-          <h2>{isDraggingFiles ? "Відпустіть файли тут" : "Оберіть файли БЧС"}</h2>
-          <p>Перетягніть XLSX-файли сюди або скористайтеся кнопкою.</p>
+          <h2>{isDraggingFiles ? "Відпустіть файли тут" : "Оберіть файли підрозділів"}</h2>
+          <p>Додайте щонайменше два XLSX-файли БЧС за одну дату.</p>
           <button className="primary-button" onClick={chooseFiles} disabled={busy}>
             {busy && <LoaderCircle className="spin" size={18} />}
             Обрати файли
@@ -208,6 +215,307 @@ export default function SummaryApp() {
           </footer>
         </section>
       )}
+    </>
+  );
+}
+
+function ComparisonFileGroup({
+  side,
+  paths,
+  active,
+  onActivate,
+  onChoose,
+  onClear,
+}: {
+  side: ComparisonSide;
+  paths: string[];
+  active: boolean;
+  onActivate: () => void;
+  onChoose: () => void;
+  onClear: () => void;
+}) {
+  const first = side === "before";
+  return (
+    <section
+      className={`comparison-file-card${active ? " active" : ""}`}
+      onMouseEnter={onActivate}
+      onClick={onActivate}
+    >
+      <div className="comparison-file-heading">
+        <div>
+          <span className="comparison-step">{first ? "1" : "2"}</span>
+          <div>
+            <h2>{first ? "Перша дата" : "Друга дата"}</h2>
+            <p>{first ? "БЧС, з якого починаємо" : "БЧС, з яким порівнюємо"}</p>
+          </div>
+        </div>
+        {paths.length > 0 && (
+          <button className="icon-button comparison-clear" onClick={(event) => { event.stopPropagation(); onClear(); }} aria-label="Прибрати файли">
+            <X size={17} />
+          </button>
+        )}
+      </div>
+      {paths.length === 0 ? (
+        <button className="comparison-picker" onClick={(event) => { event.stopPropagation(); onChoose(); }}>
+          <FileSpreadsheet size={26} aria-hidden="true" />
+          <span>Обрати XLSX-файл або кілька файлів</span>
+        </button>
+      ) : (
+        <div className="comparison-files">
+          <strong>{paths.length === 1 ? "1 файл" : `${paths.length} файлів`}</strong>
+          <ul>
+            {paths.map((path) => <li key={path} title={path}>{fileName(path)}</li>)}
+          </ul>
+          <button className="text-button" onClick={(event) => { event.stopPropagation(); onChoose(); }}>Замінити</button>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function Delta({ row }: { row: ComparisonMetric }) {
+  const sign = row.delta > 0 ? "+" : "";
+  const state = row.delta > 0 ? "positive" : row.delta < 0 ? "negative" : "neutral";
+  return <span className={`delta ${state}`}>{sign}{row.delta}</span>;
+}
+
+function ComparisonTable({ rows }: { rows: ComparisonMetric[] }) {
+  return (
+    <div className="comparison-table" role="table">
+      <div className="comparison-table-head" role="row">
+        <span>Показник</span><span>Було</span><span>Стало</span><span>Зміна</span>
+      </div>
+      {rows.map((row) => (
+        <div className="comparison-table-row" role="row" key={row.label}>
+          <strong>{row.label}</strong>
+          <span>{row.before}</span>
+          <span>{row.after}</span>
+          <Delta row={row} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ComparisonResults({ result }: { result: ComparisonResult }) {
+  const added = result.personnelChanges.filter((item) => item.kind === "added").length;
+  const removed = result.personnelChanges.filter((item) => item.kind === "removed").length;
+  const changed = result.personnelChanges.filter((item) => item.kind === "changed").length;
+
+  return (
+    <section className="comparison-result" aria-live="polite">
+      <div className="comparison-result-heading">
+        <div>
+          <span className="comparison-scope">{result.scope === "unit" ? "Один підрозділ" : "Загальне порівняння"}</span>
+          <h2>{result.title}</h2>
+          <p>{result.beforeDate} → {result.afterDate}</p>
+        </div>
+        {!result.hasChanges && <span className="no-changes">Змін не виявлено</span>}
+      </div>
+
+      <div className="comparison-highlights">
+        {result.highlights.map((item) => <p key={item}>{item}</p>)}
+      </div>
+
+      <ComparisonTable rows={result.headline} />
+
+      {result.unitChanges.length > 0 && (
+        <details className="comparison-details" open>
+          <summary>Зміни по підрозділах <span>{result.unitChanges.length}</span></summary>
+          <ul className="change-list">
+            {result.unitChanges.map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        </details>
+      )}
+
+      {result.sections.map((section) => (
+        <details className="comparison-details" open key={section.title}>
+          <summary>{section.title} <span>{section.rows.length}</span></summary>
+          <ComparisonTable rows={section.rows} />
+        </details>
+      ))}
+
+      {result.personnelChanges.length > 0 && (
+        <details className="comparison-details personnel-changes">
+          <summary>Зміни по людях <span>додано {added} · вибуло {removed} · змінено {changed}</span></summary>
+          <div className="personnel-change-list">
+            {result.personnelChanges.map((item, index) => (
+              <div className={`personnel-change ${item.kind}`} key={`${item.kind}-${item.personName}-${index}`}>
+                <strong>{item.personName}</strong>
+                <span>{item.details}</span>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </section>
+  );
+}
+
+function ComparisonWorkflow({ active }: { active: boolean }) {
+  const [beforePaths, setBeforePaths] = useState<string[]>([]);
+  const [afterPaths, setAfterPaths] = useState<string[]>([]);
+  const [activeSide, setActiveSide] = useState<ComparisonSide>("before");
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState<ComparisonResult | null>(null);
+
+  const setPaths = useCallback((side: ComparisonSide, paths: string[]) => {
+    if (side === "before") setBeforePaths(paths);
+    else setAfterPaths(paths);
+    setResult(null);
+  }, []);
+
+  async function chooseFiles(side: ComparisonSide) {
+    const selected = await open({
+      multiple: true,
+      directory: false,
+      filters: [{ name: "Excel БЧС", extensions: ["xlsx"] }],
+      title: side === "before" ? "Оберіть БЧС за першу дату" : "Оберіть БЧС за другу дату",
+    });
+    if (!selected) return;
+    setPaths(side, Array.isArray(selected) ? selected : [selected]);
+    setActiveSide(side === "before" ? "after" : "before");
+  }
+
+  useEffect(() => {
+    if (!active) return;
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    try {
+      getCurrentWebviewWindow()
+        .onDragDropEvent((event) => {
+          if (busy) return;
+          if (event.payload.type === "over") {
+            setIsDraggingFiles(true);
+          } else if (event.payload.type === "leave") {
+            setIsDraggingFiles(false);
+          } else if (event.payload.type === "drop") {
+            setIsDraggingFiles(false);
+            const target = beforePaths.length === 0
+              ? "before"
+              : afterPaths.length === 0
+                ? "after"
+                : activeSide;
+            setPaths(target, event.payload.paths);
+            setActiveSide(target === "before" ? "after" : "before");
+          }
+        })
+        .then((unlisten) => {
+          if (disposed) unlisten();
+          else stopListening = unlisten;
+        })
+        .catch(() => undefined);
+    } catch {
+      // У браузерному перегляді API вікна Tauri недоступне.
+    }
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, [active, activeSide, afterPaths.length, beforePaths.length, busy, setPaths]);
+
+  useEffect(() => {
+    if (!error) return;
+    const timeout = window.setTimeout(() => setError(""), 10_000);
+    return () => window.clearTimeout(timeout);
+  }, [error]);
+
+  async function compare() {
+    if (beforePaths.length === 0 || afterPaths.length === 0) return;
+    setBusy(true);
+    setError("");
+    try {
+      const comparison = await invoke<ComparisonResult>("compare_bcs_files", {
+        request: { beforePaths, afterPaths },
+      });
+      setResult(comparison);
+    } catch (cause) {
+      setResult(null);
+      setError(messageFrom(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      {error && <Notification kind="error">{error}</Notification>}
+      <section className={`comparison-workflow${isDraggingFiles ? " dragging" : ""}`}>
+        <div className="comparison-intro">
+          <GitCompareArrows size={24} aria-hidden="true" />
+          <div>
+            <h1>Порівняння БЧС</h1>
+            <p>Один файл — БЧС підрозділу або готовий загальний БЧС. Кілька файлів — загальне порівняння підрозділів.</p>
+          </div>
+        </div>
+
+        <div className="comparison-file-grid">
+          <ComparisonFileGroup
+            side="before"
+            paths={beforePaths}
+            active={activeSide === "before" && isDraggingFiles}
+            onActivate={() => setActiveSide("before")}
+            onChoose={() => void chooseFiles("before")}
+            onClear={() => setPaths("before", [])}
+          />
+          <ComparisonFileGroup
+            side="after"
+            paths={afterPaths}
+            active={activeSide === "after" && isDraggingFiles}
+            onActivate={() => setActiveSide("after")}
+            onChoose={() => void chooseFiles("after")}
+            onClear={() => setPaths("after", [])}
+          />
+        </div>
+
+        {isDraggingFiles && <p className="drop-help">Відпустіть файли — вони потраплять у виділений блок.</p>}
+
+        <div className="comparison-actions">
+          <span>Файли в кожному блоці мають бути за одну дату.</span>
+          <button className="primary-button" disabled={busy || beforePaths.length === 0 || afterPaths.length === 0} onClick={() => void compare()}>
+            {busy && <LoaderCircle className="spin" size={18} />}
+            Порівняти
+          </button>
+        </div>
+      </section>
+
+      {result && <ComparisonResults result={result} />}
+    </>
+  );
+}
+
+export default function SummaryApp() {
+  const [tab, setTab] = useState<AppTab>("summary");
+
+  return (
+    <main className="app-shell summary-shell">
+      <nav className="summary-tabs" role="tablist" aria-label="Режим роботи">
+        <button
+          role="tab"
+          aria-selected={tab === "summary"}
+          className={tab === "summary" ? "active" : ""}
+          onClick={() => setTab("summary")}
+        >
+          Зведення
+        </button>
+        <button
+          role="tab"
+          aria-selected={tab === "comparison"}
+          className={tab === "comparison" ? "active" : ""}
+          onClick={() => setTab("comparison")}
+        >
+          Порівняння
+        </button>
+      </nav>
+
+      <div role="tabpanel" hidden={tab !== "summary"}>
+        <SummaryWorkflow active={tab === "summary"} />
+      </div>
+      <div role="tabpanel" hidden={tab !== "comparison"}>
+        <ComparisonWorkflow active={tab === "comparison"} />
+      </div>
     </main>
   );
 }

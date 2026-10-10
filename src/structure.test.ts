@@ -65,9 +65,10 @@ describe("structure helpers", () => {
     expect(missingRequiredPersonFields(complete)).toEqual([]);
   });
 
-  it("rejects an incomplete structure before export", () => {
+  it("keeps authorized strength informational and independent from personnel rows", () => {
     expect(validateWorkspace("", "2026-10-08", "company", 5, blocks)).toBe("Вкажіть назву підрозділу.");
-    expect(validateWorkspace("Рота", "2026-10-08", "company", 4, blocks)).toBe("Кількість місць у структурі має дорівнювати кількості за штатом.");
+    expect(validateWorkspace("Рота", "2026-10-08", "company", 4, blocks)).toBe("");
+    expect(validateWorkspace("Рота", "2026-10-08", "company", 79, blocks)).toBe("");
     expect(validateWorkspace("Рота", "2026-10-08", "company", 5, blocks)).toBe("");
   });
 
