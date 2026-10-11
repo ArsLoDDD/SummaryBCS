@@ -153,12 +153,28 @@ export function defaultBlockName(kind: BlockKind): string {
   return DEFAULT_NAMES[kind];
 }
 
+function uppercaseFirstLetter(value: string): string {
+  return value.replace(/\p{L}/u, (letter) => letter.toLocaleUpperCase("uk-UA"));
+}
+
+export function formatBlockName(kind: BlockKind, value: string): string {
+  return kind === "crew" ? value.toLocaleUpperCase("uk-UA") : uppercaseFirstLetter(value);
+}
+
+export function normalizeLegacyBlockName(kind: BlockKind, value: string): string {
+  if (kind === "crew") return formatBlockName(kind, value);
+  const letters = value.match(/\p{L}/gu) ?? [];
+  const wasForcedUppercase = letters.length > 0
+    && letters.every((letter) => letter === letter.toLocaleUpperCase("uk-UA"));
+  return uppercaseFirstLetter(wasForcedUppercase ? value.toLocaleLowerCase("uk-UA") : value);
+}
+
 export function createBlock(kind: BlockKind): StructureBlock {
   const number = nextBlockNumber++;
   return {
     id: `block-${Date.now()}-${number}`,
     kind,
-    name: defaultBlockName(kind),
+    name: formatBlockName(kind, defaultBlockName(kind)),
     positionName: "",
     slots: 1,
     status: kind === "crew" ? CREW_STATUSES[0] : "",
@@ -180,7 +196,7 @@ export function createDefaultCompanyBlocks(): StructureBlock[] {
     ...crews,
     createBlock("companyManagement"),
     createBlock("platoonManagement"),
-    { ...department, name: "ВІДДІЛЕННЯ 1" },
+    { ...department, name: "Відділення 1" },
     createBlock("custom"),
   ];
 }

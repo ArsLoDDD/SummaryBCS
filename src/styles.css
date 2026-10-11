@@ -1427,6 +1427,7 @@ button:disabled {
 .bcs-block.block-company-management td { background: #ccc0da; }
 .bcs-block.block-platoon-management td { background: #c7bed0; }
 .bcs-block.block-section td { background: #dbeef4; }
+.bcs-block.block-other td { background: #d7e4bd; }
 .bcs-block.block-unassigned td { background: #d7e4bd; }
 .bcs-block.block-attached td { background: #f2dcdb; }
 .bcs-block.block-operational td { background: #f2dcdb; }

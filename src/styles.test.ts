@@ -14,4 +14,8 @@ describe("BCS table text containment", () => {
       /\.bcs-editor-table \.custom-select-trigger\s*\{[^}]*overflow:\s*hidden;[^}]*\}/s,
     );
   });
+
+  it("uses the reference color for the singleton Інші block", () => {
+    expect(styles).toMatch(/\.bcs-block\.block-other td\s*\{\s*background:\s*#d7e4bd;\s*\}/i);
+  });
 });

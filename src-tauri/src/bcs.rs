@@ -312,6 +312,9 @@ fn nonnegative_count(value: &str, label: &str) -> Result<(), String> {
 }
 
 fn color_key(style: Option<usize>, section: &str, crew_status: &str) -> String {
+    if normalize(section) == normalize("Інші") {
+        return "unassigned".into();
+    }
     match style {
         Some(171) => return "crew-working".into(),
         Some(172) => return "crew-forming".into(),
@@ -2341,6 +2344,12 @@ mod tests {
         assert_eq!(count_chart_major_unit(100.1), 50);
         assert_eq!(count_chart_major_unit(500.0), 50);
         assert_eq!(count_chart_major_unit(500.1), 100);
+    }
+
+    #[test]
+    fn treats_other_blocks_as_the_reference_green_even_in_older_exports() {
+        assert_eq!(color_key(Some(176), "Інші", ""), "unassigned");
+        assert_eq!(color_key(None, "інші", ""), "unassigned");
     }
 
     #[test]

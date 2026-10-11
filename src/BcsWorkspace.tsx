@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { ChevronDown, ChevronUp, Download, LoaderCircle, Minus, Plus, Trash2, Users } from "lucide-react";
 import CustomSelect, { type CustomSelectOption } from "./CustomSelect";
-import { crewTypeSummaryRows } from "./bcsSummary";
+import { crewFunctionalSummaryRows } from "./bcsSummary";
 import {
   BCS_HEADERS,
   BLOCK_TYPES,
@@ -17,11 +17,13 @@ import {
   deduplicateSingletonBlocks,
   defaultBlockName,
   emptyPerson,
+  formatBlockName,
   formatFullName,
   formatReportDateForExport,
   isSingletonBlockKind,
   isRequiredManagementBlock,
   missingRequiredPersonFields,
+  normalizeLegacyBlockName,
   normalizedSlots,
   peopleForExport,
   personKey,
@@ -136,15 +138,6 @@ const SUMMARY_UAV_TYPES = [
   "ФПВ Перехоплювач",
 ] as const;
 const TABLE_ZOOM_STEPS = [50, 60, 70, 80, 90, 100, 110, 125] as const;
-type CrewStatusGroup = "forming" | "working" | "inactive";
-
-function crewStatusGroup(status: string): CrewStatusGroup {
-  const normalized = upper(status).replace(/\s+/g, "");
-  if (normalized.startsWith("ФОРМ")) return "forming";
-  if (normalized.startsWith("ПРАЦ") || normalized === "АКТИВНИЙ") return "working";
-  return "inactive";
-}
-
 function isExternalBlockKind(kind: BlockKind): boolean {
   return kind === "attached" || kind === "operationalSubordination" || kind === "temporary";
 }
@@ -185,6 +178,7 @@ function blockTableClass(kind: BlockKind): string {
   if (kind === "attached") return "block-attached";
   if (kind === "operationalSubordination") return "block-operational";
   if (kind === "temporary") return "block-temporary";
+  if (kind === "custom") return "block-other";
   if (kind === "unassigned") return "block-unassigned";
   return "block-section";
 }
@@ -237,7 +231,7 @@ function normalizeLoadedBlocks(value: unknown): StructureBlock[] | null {
   const normalized = blocks.map((block) => ({
     id: block.id,
     kind: block.kind,
-    name: typeof block.name === "string" ? block.name : "",
+    name: normalizeLegacyBlockName(block.kind, typeof block.name === "string" ? block.name : ""),
     positionName: typeof block.positionName === "string" ? block.positionName : "",
     slots: typeof block.slots === "number" ? block.slots : 1,
     status: typeof block.status === "string" && block.status
@@ -341,14 +335,7 @@ export default function BcsWorkspace({ variant }: Props) {
         .filter(({ block }) => block.kind === "crew")
         .map(({ person }) => upper(person.fullName).trim()),
     ).size;
-    const functional: Array<[string, number]> = [
-      ["Екіпажів (ос-загально)", uniqueCrewPersonnel],
-      ["Екіпажів (загально)", crews.length],
-      ...crewTypeSummaryRows(crews, SUMMARY_UAV_TYPES),
-      ["Екіпажів — Формуються", crews.filter((block) => crewStatusGroup(block.status) === "forming").length],
-      ["Екіпажів — Працюючі", crews.filter((block) => crewStatusGroup(block.status) === "working").length],
-      ["Екіпажів — Не активні", crews.filter((block) => crewStatusGroup(block.status) === "inactive").length],
-    ];
+    const functional = crewFunctionalSummaryRows(crews, SUMMARY_UAV_TYPES, uniqueCrewPersonnel);
     const seenSections = new Set<string>();
     blocks.forEach((block) => {
       if (block.kind === "crew" || isExternalBlockKind(block.kind)) return;
@@ -491,14 +478,16 @@ export default function BcsWorkspace({ variant }: Props) {
   }, [draftStatus]);
 
   function updateBlock<K extends keyof StructureBlock>(id: string, field: K, value: StructureBlock[K]) {
-    const shouldUppercase = field === "name"
-      || field === "positionName"
+    const shouldUppercase = field === "positionName"
       || field === "bro"
       || field === "workSector";
-    const nextValue = shouldUppercase && typeof value === "string" ? upper(value) : value;
-    setBlocks((current) => current.map((block) =>
-      block.id === id ? { ...block, [field]: nextValue } : block,
-    ));
+    setBlocks((current) => current.map((block) => {
+      if (block.id !== id) return block;
+      const nextValue = field === "name" && typeof value === "string"
+        ? formatBlockName(block.kind, value)
+        : shouldUppercase && typeof value === "string" ? upper(value) : value;
+      return { ...block, [field]: nextValue };
+    }));
   }
 
   function updateOfficialSlots(id: string, value: number) {
@@ -537,7 +526,7 @@ export default function BcsWorkspace({ variant }: Props) {
       return {
         ...block,
         kind,
-        name: upper(defaultBlockName(kind)),
+        name: formatBlockName(kind, defaultBlockName(kind)),
         status: kind === "crew" ? (block.status || CREW_STATUSES[0]) : "",
         uavType: kind === "crew" ? (block.uavType || UAV_TYPES[0]) : "",
         bro: kind === "crew" ? block.bro : "",

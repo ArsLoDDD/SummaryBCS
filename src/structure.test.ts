@@ -8,10 +8,12 @@ import {
   createDefaultCompanyBlocks,
   deduplicateSingletonBlocks,
   emptyPerson,
+  formatBlockName,
   formatFullName,
   formatReportDateForExport,
   isRequiredManagementBlock,
   missingRequiredPersonFields,
+  normalizeLegacyBlockName,
   peopleForExport,
   personHasAnyData,
   quickBlockTypesForStructure,
@@ -86,6 +88,13 @@ describe("structure helpers", () => {
     expect(formatFullName("  петренко  о.п. ")).toBe("  ПЕТРЕНКО  О.П. ");
   });
 
+  it("uppercases crew names but only starts other block names with a capital letter", () => {
+    expect(formatBlockName("crew", "екіпаж альфа")).toBe("ЕКІПАЖ АЛЬФА");
+    expect(formatBlockName("department", "відділення БпАК")).toBe("Відділення БпАК");
+    expect(normalizeLegacyBlockName("department", "ВІДДІЛЕННЯ 1")).toBe("Відділення 1");
+    expect(normalizeLegacyBlockName("custom", "ІНШІ")).toBe("Інші");
+  });
+
   it("offers every standard block while keeping the main shortcuts simple", () => {
     expect(BLOCK_TYPES).toHaveLength(11);
     expect(BLOCK_TYPES.some((item) => item.value === "informationDepartment")).toBe(true);
@@ -113,6 +122,7 @@ describe("structure helpers", () => {
     expect(defaults.filter((block) => block.kind === "companyManagement")).toHaveLength(1);
     expect(defaults.filter((block) => block.kind === "platoonManagement")).toHaveLength(1);
     expect(defaults.filter((block) => block.kind === "custom")).toHaveLength(1);
+    expect(defaults.find((block) => block.kind === "department")?.name).toBe("Відділення 1");
     expect(defaults.every((block) => block.name.trim())).toBe(true);
     expect(defaults.map((block) => block.kind)).toEqual([
       "crew",
@@ -143,7 +153,7 @@ describe("structure helpers", () => {
   });
 
   it("gives every newly added block a usable default name", () => {
-    expect(createBlock("crew").name).toBe("Екіпаж");
+    expect(createBlock("crew").name).toBe("ЕКІПАЖ");
     expect(createBlock("department").name).toBe("Відділення");
   });
 
