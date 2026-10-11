@@ -1074,7 +1074,6 @@ button:disabled {
 }
 
 .bcs-table-scale {
-  width: max-content;
   min-width: 100%;
   zoom: var(--bcs-table-zoom);
 }
