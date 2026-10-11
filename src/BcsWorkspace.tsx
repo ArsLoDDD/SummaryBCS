@@ -139,7 +139,10 @@ const SUMMARY_UAV_TYPES = [
 ] as const;
 const TABLE_ZOOM_STEPS = [50, 60, 70, 80, 90, 100, 110, 125] as const;
 function isExternalBlockKind(kind: BlockKind): boolean {
-  return kind === "attached" || kind === "operationalSubordination" || kind === "temporary";
+  return kind === "attached"
+    || kind === "operationalSubordination"
+    || kind === "temporary"
+    || kind === "temporaryActing";
 }
 
 function statusClass(status: string): string {
@@ -177,7 +180,7 @@ function blockTableClass(kind: BlockKind): string {
   if (kind === "platoonManagement") return "block-platoon-management";
   if (kind === "attached") return "block-attached";
   if (kind === "operationalSubordination") return "block-operational";
-  if (kind === "temporary") return "block-temporary";
+  if (kind === "temporary" || kind === "temporaryActing") return "block-temporary";
   if (kind === "custom") return "block-other";
   if (kind === "unassigned") return "block-unassigned";
   return "block-section";
@@ -190,6 +193,7 @@ function sectionForBlock(block: StructureBlock): string {
   if (block.kind === "attached") return "Прикомандировані";
   if (block.kind === "operationalSubordination") return "Оперативне підпорядкування";
   if (block.kind === "temporary") return "Тимчасово прибулі";
+  if (block.kind === "temporaryActing") return "Тимчасові з ТВО";
   if (block.kind === "unassigned") return "Не розподілені";
   return block.name.trim() || blockTypeLabel(block.kind);
 }
@@ -301,7 +305,10 @@ export default function BcsWorkspace({ variant }: Props) {
     ).filter(({ person }) => person.fullName.trim());
     const isOwn = (block: StructureBlock) => !isExternalBlockKind(block.kind);
     const isTemporaryActing = (block: StructureBlock, person: PersonInput) =>
-      block.kind === "temporary" && upper(person.position).includes("ТВО");
+      block.kind === "temporaryActing"
+      || (block.kind === "temporary" && upper(person.position).includes("ТВО"));
+    const isTemporary = (block: StructureBlock) =>
+      block.kind === "temporary" || block.kind === "temporaryActing";
     const countOwnLocation = (location: string) => populated.filter(({ block, person }) =>
       isOwn(block) && person.location === location,
     ).length;
@@ -325,7 +332,7 @@ export default function BcsWorkspace({ variant }: Props) {
       ["Оперативне підпорядкування", populated.filter(({ block }) => block.kind === "operationalSubordination").length],
       ["ПТЗ Новостав", countOwnLocation("ПТЗ Новостав")],
       ["СЗЧ", countOwnLocation("СЗЧ")],
-      ["Тимчасово прибулі", populated.filter(({ block }) => block.kind === "temporary").length],
+      ["Тимчасово прибулі", populated.filter(({ block }) => isTemporary(block)).length],
       ["Тимчасово прибулі з ТВО", populated.filter(({ block, person }) => isTemporaryActing(block, person)).length],
     ];
 

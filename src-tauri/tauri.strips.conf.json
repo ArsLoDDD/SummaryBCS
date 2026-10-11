@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Редактор позицій по смугах",
+  "mainBinaryName": "StripsEditor",
+  "identifier": "ua.summarybcs.strips",
+  "build": {
+    "beforeDevCommand": "npm run dev:strips",
+    "beforeBuildCommand": "npm run build:strips"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Редактор позицій по смугах",
+        "width": 1440,
+        "height": 900,
+        "maximized": true,
+        "minWidth": 940,
+        "minHeight": 680,
+        "backgroundColor": "#f5f6f7"
+      }
+    ]
+  }
+}

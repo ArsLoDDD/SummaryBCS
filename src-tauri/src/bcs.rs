@@ -311,6 +311,16 @@ fn nonnegative_count(value: &str, label: &str) -> Result<(), String> {
     parse_integer(value, label).map(|_| ())
 }
 
+fn is_temporary_section(section: &str) -> bool {
+    matches!(section, "Тимчасово прибулі" | "Тимчасові з ТВО")
+}
+
+fn is_temporary_acting(row: &BcsRow) -> bool {
+    row.section == "Тимчасові з ТВО"
+        || (row.section == "Тимчасово прибулі"
+            && row.personnel_position.to_uppercase().contains("ТВО"))
+}
+
 fn color_key(style: Option<usize>, section: &str, crew_status: &str) -> String {
     if normalize(section) == normalize("Інші") {
         return "unassigned".into();
@@ -342,7 +352,7 @@ fn color_key(style: Option<usize>, section: &str, crew_status: &str) -> String {
     } else if section == "Прикомандировані" || section == "Оперативне підпорядкування"
     {
         "attached".into()
-    } else if section == "Тимчасово прибулі" {
+    } else if is_temporary_section(section) {
         "temporary".into()
     } else {
         "independent".into()
@@ -492,11 +502,11 @@ fn parse_file(path: &Path) -> Result<ParsedBcs, String> {
         let crew_status = values[7].clone();
         let full_name = values[12].to_uppercase();
         rows.push(BcsRow {
-            is_temporary: section == "Тимчасово прибулі",
+            is_temporary: is_temporary_section(&section),
             is_external: matches!(
                 section.as_str(),
-                "Прикомандировані" | "Оперативне підпорядкування" | "Тимчасово прибулі"
-            ),
+                "Прикомандировані" | "Оперативне підпорядкування"
+            ) || is_temporary_section(&section),
             color_key: color_key(style, &section, &crew_status),
             group_key: format!("{}:{group_number}", &id[..16]),
             section,
@@ -717,7 +727,7 @@ fn snapshot(units: &[ParsedBcs], locations: &[String]) -> Result<ComparisonSnaps
         let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
         let temporary_acting = personnel
             .iter()
-            .filter(|row| row.is_temporary && row.personnel_position.to_uppercase().contains("ТВО"))
+            .filter(|row| is_temporary_acting(row))
             .count() as i64;
         let listed = own
             .checked_add(temporary_acting)
@@ -757,9 +767,7 @@ fn snapshot(units: &[ParsedBcs], locations: &[String]) -> Result<ComparisonSnaps
                 let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
                 let temporary_acting = personnel
                     .iter()
-                    .filter(|row| {
-                        row.is_temporary && row.personnel_position.to_uppercase().contains("ТВО")
-                    })
+                    .filter(|row| is_temporary_acting(row))
                     .count() as i64;
                 let present = personnel
                     .iter()
@@ -835,7 +843,7 @@ fn snapshot(units: &[ParsedBcs], locations: &[String]) -> Result<ComparisonSnaps
     };
     let temporary_acting = all_personnel
         .iter()
-        .filter(|row| row.is_temporary && row.personnel_position.to_uppercase().contains("ТВО"))
+        .filter(|row| is_temporary_acting(row))
         .count() as i64;
     for (label, count) in [
         ("Відпустка", count_own_location("ВІДП")),
@@ -1279,7 +1287,7 @@ fn analytics_data(units: &[ParsedBcs], locations: &[String]) -> Result<Analytics
         let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
         let temporary_acting = personnel
             .iter()
-            .filter(|row| row.is_temporary && row.personnel_position.to_uppercase().contains("ТВО"))
+            .filter(|row| is_temporary_acting(row))
             .count() as i64;
         let listed = own
             .checked_add(temporary_acting)
@@ -2118,7 +2126,7 @@ fn write_summary(
     };
     let temporary_acting = personnel
         .iter()
-        .filter(|row| row.is_temporary && row.personnel_position.to_uppercase().contains("ТВО"))
+        .filter(|row| is_temporary_acting(row))
         .count() as i64;
     let present = personnel
         .iter()
@@ -2314,10 +2322,11 @@ mod tests {
     }
 
     fn summary_value(xml: &str, label: &str) -> i64 {
+        let marker = format!(">{}</t>", esc(label));
         let label_at = xml
-            .find(label)
+            .rfind(&marker)
             .unwrap_or_else(|| panic!("missing label: {label}"));
-        let after_label = &xml[label_at + label.len()..];
+        let after_label = &xml[label_at + marker.len()..];
         let value_start = after_label.find("<v>").unwrap() + 3;
         let value_end = after_label[value_start..].find("</v>").unwrap() + value_start;
         after_label[value_start..value_end].parse().unwrap()
@@ -2350,6 +2359,7 @@ mod tests {
     fn treats_other_blocks_as_the_reference_green_even_in_older_exports() {
         assert_eq!(color_key(Some(176), "Інші", ""), "unassigned");
         assert_eq!(color_key(None, "інші", ""), "unassigned");
+        assert_eq!(color_key(None, "Тимчасові з ТВО", ""), "temporary");
     }
 
     #[test]
@@ -2418,20 +2428,31 @@ mod tests {
                 location: "ПУ".into(),
                 ..BcsRow::default()
             },
+            BcsRow {
+                is_temporary: true,
+                is_external: true,
+                group_key: "temporary-acting".into(),
+                section: "Тимчасові з ТВО".into(),
+                personnel_position: "ОПЕРАТОР".into(),
+                full_name: "ОСОБА-7".into(),
+                location: "ПУ".into(),
+                ..BcsRow::default()
+            },
         ];
 
         let mut xml = String::new();
         write_summary(&mut xml, 100, &[unit], &["ПУ".into(), "ВІДП".into()]).unwrap();
 
-        assert_eq!(summary_value(&xml, "По списку"), 4);
+        assert_eq!(summary_value(&xml, "По списку"), 5);
         assert_eq!(summary_value(&xml, "В наявності"), 2);
         assert_eq!(summary_value(&xml, "Прикомандировані"), 1);
         assert_eq!(summary_value(&xml, "Оперативне підпорядкування"), 1);
-        assert_eq!(summary_value(&xml, "Тимчасово прибулі з ТВО"), 1);
+        assert_eq!(summary_value(&xml, "Тимчасово прибулі"), 3);
+        assert_eq!(summary_value(&xml, "Тимчасово прибулі з ТВО"), 2);
         assert_eq!(summary_value(&xml, "Екіпажів (ос-загально)"), 1);
         assert_eq!(summary_value(&xml, "Управління роти"), 0);
-        assert_eq!(summary_value(&xml, "ПУ"), 6);
-        assert_eq!(summary_value(&xml, "Загалом"), 7);
+        assert_eq!(summary_value(&xml, "ПУ"), 7);
+        assert_eq!(summary_value(&xml, "Загалом"), 8);
     }
 
     #[test]

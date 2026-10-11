@@ -96,7 +96,7 @@ describe("structure helpers", () => {
   });
 
   it("offers every standard block while keeping the main shortcuts simple", () => {
-    expect(BLOCK_TYPES).toHaveLength(11);
+    expect(BLOCK_TYPES).toHaveLength(12);
     expect(BLOCK_TYPES.some((item) => item.value === "informationDepartment")).toBe(true);
     expect(BLOCK_TYPES.some((item) => item.value === "operationalSubordination")).toBe(true);
     expect(QUICK_BLOCK_TYPES.map((item) => item.value)).toEqual([
@@ -108,6 +108,7 @@ describe("structure helpers", () => {
       "attached",
       "operationalSubordination",
       "temporary",
+      "temporaryActing",
     ]);
     expect(quickBlockTypesForStructure("company").map((item) => item.value)).not.toContain("companyManagement");
     expect(quickBlockTypesForStructure("company").map((item) => item.value)).toContain("platoonManagement");
@@ -155,6 +156,7 @@ describe("structure helpers", () => {
   it("gives every newly added block a usable default name", () => {
     expect(createBlock("crew").name).toBe("ЕКІПАЖ");
     expect(createBlock("department").name).toBe("Відділення");
+    expect(createBlock("temporaryActing").name).toBe("Тимчасові з ТВО");
   });
 
   it("repairs blank legacy names and removes duplicate singleton blocks", () => {
@@ -179,6 +181,7 @@ describe("structure helpers", () => {
   it("keeps the same block sequence as the reference BCS", () => {
     const ordered = sortBlocksByBcsOrder([
       { ...blocks[0], id: "temporary", kind: "temporary" },
+      { ...blocks[0], id: "temporary-acting", kind: "temporaryActing" },
       { ...blocks[0], id: "other", kind: "custom" },
       blocks[0],
       { ...blocks[0], id: "department", kind: "department" },
@@ -197,6 +200,7 @@ describe("structure helpers", () => {
       "attached",
       "operationalSubordination",
       "temporary",
+      "temporaryActing",
     ]);
   });
 });

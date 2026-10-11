@@ -81,6 +81,7 @@ export default function CustomSelect<T extends string>({
       <button
         type="button"
         className="custom-select-trigger"
+        title={selected?.label}
         aria-label={ariaLabel}
         aria-haspopup="listbox"
         aria-expanded={open}

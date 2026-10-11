@@ -27,7 +27,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: npm ci
-      - name: Перевірити «Зведення БЧС» і «Редактор БЧС»
+      - name: Перевірити всі робочі версії
         run: npm run test:ci
 
   build:
@@ -44,6 +44,9 @@ jobs:
           - app: Editor
             build_command: npm run tauri:build:editor
             artifact_name: BCS-Windows-Editor
+          - app: Strips
+            build_command: npm run tauri:build:strips
+            artifact_name: BCS-Windows-Strips
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

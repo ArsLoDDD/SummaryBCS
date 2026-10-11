@@ -11,6 +11,7 @@ export type BlockKind =
   | "attached"
   | "operationalSubordination"
   | "temporary"
+  | "temporaryActing"
   | "unassigned"
   | "custom";
 
@@ -67,6 +68,7 @@ export const BLOCK_TYPES: ReadonlyArray<{ value: BlockKind; label: string; short
   { value: "attached", label: "Прикомандировані", shortLabel: "Прикомандировані" },
   { value: "operationalSubordination", label: "Оперативне підпорядкування", shortLabel: "Опер. підпорядкування" },
   { value: "temporary", label: "Тимчасово прибулі", shortLabel: "Тимчасові" },
+  { value: "temporaryActing", label: "Тимчасові з ТВО", shortLabel: "Тимчасові з ТВО" },
   { value: "unassigned", label: "Не розподілені", shortLabel: "Не розподілені" },
 ];
 
@@ -79,6 +81,7 @@ export const QUICK_BLOCK_TYPES = BLOCK_TYPES.filter((item) =>
   || item.value === "attached"
   || item.value === "operationalSubordination"
   || item.value === "temporary"
+  || item.value === "temporaryActing"
 );
 
 export function quickBlockTypesForStructure(structureType: StructureType) {
@@ -143,6 +146,7 @@ const DEFAULT_NAMES: Record<BlockKind, string> = {
   attached: "Прикомандировані",
   operationalSubordination: "Оперативне підпорядкування",
   temporary: "Тимчасово прибулі",
+  temporaryActing: "Тимчасові з ТВО",
   unassigned: "Не розподілені",
   custom: "Інші",
 };
@@ -239,7 +243,8 @@ const BLOCK_ORDER: Record<BlockKind, number> = {
   attached: 6,
   operationalSubordination: 7,
   temporary: 8,
-  unassigned: 9,
+  temporaryActing: 9,
+  unassigned: 10,
 };
 
 export function sortBlocksByBcsOrder(blocks: StructureBlock[]): StructureBlock[] {

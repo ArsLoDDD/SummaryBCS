@@ -92,6 +92,8 @@ pub enum BlockKind {
     OperationalSubordination,
     #[serde(rename = "temporary")]
     Temporary,
+    #[serde(rename = "temporaryActing")]
+    TemporaryActing,
     #[serde(rename = "unassigned")]
     Unassigned,
     #[serde(rename = "custom", alias = "other")]
@@ -305,7 +307,8 @@ fn block_order(kind: BlockKind) -> u8 {
         BlockKind::Attached => 6,
         BlockKind::OperationalSubordination => 7,
         BlockKind::Temporary => 8,
-        BlockKind::Unassigned => 9,
+        BlockKind::TemporaryActing => 9,
+        BlockKind::Unassigned => 10,
     }
 }
 
@@ -320,6 +323,7 @@ fn default_block_name(kind: BlockKind) -> &'static str {
         BlockKind::Attached => "Прикомандировані",
         BlockKind::OperationalSubordination => "Оперативне підпорядкування",
         BlockKind::Temporary => "Тимчасово прибулі",
+        BlockKind::TemporaryActing => "Тимчасові з ТВО",
         BlockKind::Unassigned => "Не розподілені",
         BlockKind::Custom => "Інші",
     }
@@ -563,6 +567,7 @@ fn section_for(kind: BlockKind, name: &str) -> String {
         BlockKind::Attached => "Прикомандировані".into(),
         BlockKind::OperationalSubordination => "Оперативне підпорядкування".into(),
         BlockKind::Temporary => "Тимчасово прибулі".into(),
+        BlockKind::TemporaryActing => "Тимчасові з ТВО".into(),
         BlockKind::Unassigned => "Не розподілені".into(),
     }
 }
@@ -668,7 +673,7 @@ fn style_for(block: &PreparedBlock) -> usize {
         BlockKind::Department | BlockKind::InformationDepartment | BlockKind::Independent => 176,
         BlockKind::Custom | BlockKind::Unassigned => 177,
         BlockKind::Attached | BlockKind::OperationalSubordination => 178,
-        BlockKind::Temporary => 179,
+        BlockKind::Temporary | BlockKind::TemporaryActing => 179,
     }
 }
 
@@ -985,7 +990,10 @@ fn format_full_name(value: &str) -> String {
 fn is_external_kind(kind: BlockKind) -> bool {
     matches!(
         kind,
-        BlockKind::Attached | BlockKind::OperationalSubordination | BlockKind::Temporary
+        BlockKind::Attached
+            | BlockKind::OperationalSubordination
+            | BlockKind::Temporary
+            | BlockKind::TemporaryActing
     )
 }
 
@@ -1032,7 +1040,15 @@ fn write_summary(
         .filter(|(_, person)| !person.full_name.is_empty())
         .collect::<Vec<_>>();
     let temp_acting = |block: &&PreparedBlock, person: &&PersonInput| {
-        block.kind == BlockKind::Temporary && person.position.to_uppercase().contains("ТВО")
+        block.kind == BlockKind::TemporaryActing
+            || (block.kind == BlockKind::Temporary
+                && person.position.to_uppercase().contains("ТВО"))
+    };
+    let is_temporary = |block: &&PreparedBlock| {
+        matches!(
+            block.kind,
+            BlockKind::Temporary | BlockKind::TemporaryActing
+        )
     };
     let is_own = |block: &&PreparedBlock| !is_external_kind(block.kind);
     let by_list = all_people
@@ -1064,13 +1080,23 @@ fn write_summary(
             ("Q", "<>Прикомандировані"),
             ("Q", "<>Оперативне підпорядкування"),
             ("Q", "<>Тимчасово прибулі"),
+            ("Q", "<>Тимчасові з ТВО"),
         ],
         false,
     );
-    let temp_acting_formula = countifs_formula(
-        data_end,
-        &[("Q", "Тимчасово прибулі"), ("K", "*ТВО*")],
-        false,
+    let temp_acting_formula = format!(
+        "{}+{}",
+        countifs_formula(data_end, &[("Q", "Тимчасові з ТВО")], false),
+        countifs_formula(
+            data_end,
+            &[("Q", "Тимчасово прибулі"), ("K", "*ТВО*")],
+            false,
+        )
+    );
+    let temporary_formula = format!(
+        "{}+{}",
+        countifs_formula(data_end, &[("Q", "Тимчасово прибулі")], false),
+        countifs_formula(data_end, &[("Q", "Тимчасові з ТВО")], false),
     );
     let present_normal_formula = countifs_formula(
         data_end,
@@ -1078,6 +1104,7 @@ fn write_summary(
             ("Q", "<>Прикомандировані"),
             ("Q", "<>Оперативне підпорядкування"),
             ("Q", "<>Тимчасово прибулі"),
+            ("Q", "<>Тимчасові з ТВО"),
         ],
         true,
     );
@@ -1089,6 +1116,7 @@ fn write_summary(
                 ("Q", "<>Прикомандировані"),
                 ("Q", "<>Оперативне підпорядкування"),
                 ("Q", "<>Тимчасово прибулі"),
+                ("Q", "<>Тимчасові з ТВО"),
             ],
             false,
         )
@@ -1173,14 +1201,10 @@ fn write_summary(
         ),
         (
             "Тимчасово прибулі".to_string(),
-            Some(countifs_formula(
-                data_end,
-                &[("Q", "Тимчасово прибулі")],
-                false,
-            )),
+            Some(temporary_formula),
             all_people
                 .iter()
-                .filter(|(block, _)| block.kind == BlockKind::Temporary)
+                .filter(|(block, _)| is_temporary(block))
                 .count() as i64,
         ),
         (
@@ -1438,10 +1462,11 @@ mod tests {
     }
 
     fn summary_value(xml: &str, label: &str) -> i64 {
+        let marker = format!(">{}</t>", esc(label));
         let label_at = xml
-            .find(label)
+            .rfind(&marker)
             .unwrap_or_else(|| panic!("missing label: {label}"));
-        let after_label = &xml[label_at + label.len()..];
+        let after_label = &xml[label_at + marker.len()..];
         let value_start = after_label.find("<v>").unwrap() + 3;
         let value_end = after_label[value_start..].find("</v>").unwrap() + value_start;
         after_label[value_start..value_end].parse().unwrap()
@@ -1783,6 +1808,80 @@ mod tests {
         assert_eq!(kind, BlockKind::InformationDepartment);
         let operational: BlockKind = serde_json::from_str("\"operationalSubordination\"").unwrap();
         assert_eq!(operational, BlockKind::OperationalSubordination);
+        let temporary_acting: BlockKind = serde_json::from_str("\"temporaryActing\"").unwrap();
+        assert_eq!(temporary_acting, BlockKind::TemporaryActing);
+    }
+
+    #[test]
+    fn exports_temporary_acting_as_a_separate_block_and_counts_it_in_summary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = std::env::var_os("BCS_TEMP_ACTING_OUTPUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| directory.path().join("temporary-acting.xlsx"));
+        let mut source_blocks = blocks();
+        source_blocks.push(StructureBlock {
+            id: "temporary".into(),
+            kind: BlockKind::Temporary,
+            name: "Тимчасово прибулі".into(),
+            position_name: String::new(),
+            slots: 1,
+            status: None,
+            uav_type: None,
+            bro: String::new(),
+            work_sector: String::new(),
+            uav_name: String::new(),
+            crew_actual: 0,
+        });
+        source_blocks.push(StructureBlock {
+            id: "temporary-acting".into(),
+            kind: BlockKind::TemporaryActing,
+            name: "Тимчасові з ТВО".into(),
+            position_name: String::new(),
+            slots: 1,
+            status: None,
+            uav_type: None,
+            bro: String::new(),
+            work_sector: String::new(),
+            uav_name: String::new(),
+            crew_actual: 0,
+        });
+        let mut people = complete_people();
+        people.push(PersonInput {
+            block_id: "temporary".into(),
+            position: "Оператор".into(),
+            rank: "солдат".into(),
+            full_name: "ТИМЧАСОВИЙ Один".into(),
+            duties: String::new(),
+            location: "ПУ".into(),
+            note: String::new(),
+        });
+        people.push(PersonInput {
+            block_id: "temporary-acting".into(),
+            position: "Оператор".into(),
+            rank: "солдат".into(),
+            full_name: "ТИМЧАСОВИЙ Два".into(),
+            duties: String::new(),
+            location: "ПУ".into(),
+            note: String::new(),
+        });
+
+        export_filled(FilledBcsRequest {
+            unit_name: "1 РУБАК".into(),
+            report_date: "08.10.2026".into(),
+            structure_type: StructureType::Company,
+            authorized_strength: 5,
+            blocks: source_blocks,
+            people,
+            output_path: path.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+
+        let sheet = read_entry(&path, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains("Тимчасові з ТВО"));
+        assert_eq!(summary_value(&sheet, "По списку"), 6);
+        assert_eq!(summary_value(&sheet, "Тимчасово прибулі"), 2);
+        assert_eq!(summary_value(&sheet, "Тимчасово прибулі з ТВО"), 1);
+        assert!(sheet.contains("$Q$7:$Q$13,&quot;Тимчасові з ТВО&quot;"));
     }
 
     #[test]

@@ -16,7 +16,7 @@ const MAX_DRAFT_SIZE: usize = 20 * 1024 * 1024;
 
 fn safe_variant(variant: &str) -> Result<&str, String> {
     match variant {
-        "template" | "editor" => Ok(variant),
+        "template" | "editor" | "strips" => Ok(variant),
         _ => Err("Невідомий тип чернетки.".into()),
     }
 }

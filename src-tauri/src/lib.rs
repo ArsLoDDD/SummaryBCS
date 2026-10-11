@@ -1,6 +1,7 @@
 mod bcs;
 mod draft;
 mod generator;
+mod strips;
 mod xlsx;
 
 use bcs::{ComparisonRequest, ComparisonResult, ExportRequest, ImportPreview};
@@ -34,6 +35,11 @@ fn export_filled_bcs(request: FilledBcsRequest) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn export_strips_workbook(request: strips::StripsExportRequest) -> Result<String, String> {
+    strips::export_strips(request)
+}
+
+#[tauri::command]
 fn save_workspace_draft(
     app: tauri::AppHandle,
     variant: String,
@@ -57,6 +63,7 @@ pub fn run() {
             compare_bcs_files,
             export_bcs_template,
             export_filled_bcs,
+            export_strips_workbook,
             save_workspace_draft,
             load_workspace_draft
         ])
