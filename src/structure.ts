@@ -328,8 +328,6 @@ export function personHasAnyData(person: PersonInput): boolean {
 }
 
 export function missingRequiredPersonFields(person: PersonInput): string[] {
-  if (!personHasAnyData(person)) return [];
-
   const missing: string[] = [];
   if (!person.rank.trim()) missing.push("Звання");
   if (!person.fullName.trim()) missing.push("П.І.Б.");

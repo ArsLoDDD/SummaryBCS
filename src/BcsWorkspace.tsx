@@ -24,7 +24,6 @@ import {
   missingRequiredPersonFields,
   normalizedSlots,
   peopleForExport,
-  personHasAnyData,
   personKey,
   quickBlockTypesForStructure,
   reconcileBlocksForStructure,
@@ -283,17 +282,20 @@ export default function BcsWorkspace({ variant }: Props) {
     authorizedStrength,
     exportBlocks,
   );
-  const missingPersonFields = useMemo(() => {
+  const personValidation = useMemo(() => {
     const missing = new Set<string>();
+    let incompleteCount = 0;
     if (isEditor) {
       people.forEach((person) => {
-        missingRequiredPersonFields(person).forEach((field) => missing.add(field));
+        const missingForPerson = missingRequiredPersonFields(person);
+        if (missingForPerson.length > 0) incompleteCount += 1;
+        missingForPerson.forEach((field) => missing.add(field));
       });
     }
-    return [...missing];
+    return { incompleteCount, missingFields: [...missing] };
   }, [isEditor, people]);
-  const personValidationError = missingPersonFields.length > 0
-    ? `Для кожної заповненої людини вкажіть: ${missingPersonFields.join(", ")}.`
+  const personValidationError = personValidation.incompleteCount > 0
+    ? `Не заповнено місць: ${personValidation.incompleteCount}. Для кожного вкажіть: ${personValidation.missingFields.join(", ")}.`
     : "";
   const exportUnavailableReason = workspaceValidationError || personValidationError;
   const sheetSummary = useMemo(() => {
@@ -748,7 +750,6 @@ export default function BcsWorkspace({ variant }: Props) {
                     {Array.from({ length: rowCount }, (_, personIndex) => {
                       const key = personKey(block.id, personIndex);
                       const person = peopleBySlot[key] ?? emptyPerson(block.id);
-                      const startedPerson = personHasAnyData(person);
                       return (
                         <tr key={key}>
                           {personIndex === 0 && (
@@ -871,7 +872,7 @@ export default function BcsWorkspace({ variant }: Props) {
                             </>
                           )}
                           <td><input aria-label={`Посада по штату, рядок ${personIndex + 1}`} value={person.position} onChange={(event) => updatePerson(block.id, personIndex, "position", event.target.value)} /></td>
-                          <td className={startedPerson && !person.rank.trim() ? "bcs-warning-cell" : ""}>
+                          <td className={!person.rank.trim() ? "bcs-warning-cell" : ""}>
                             <CustomSelect
                               ariaLabel={`Військове звання, рядок ${personIndex + 1}`}
                               value={person.rank}
@@ -880,9 +881,9 @@ export default function BcsWorkspace({ variant }: Props) {
                               onChange={(value) => updatePerson(block.id, personIndex, "rank", value)}
                             />
                           </td>
-                          <td className={startedPerson && !person.fullName.trim() ? "bcs-warning-cell" : ""}><input aria-label={`П.І.Б., рядок ${personIndex + 1}`} value={person.fullName} onChange={(event) => updatePerson(block.id, personIndex, "fullName", event.target.value)} /></td>
+                          <td className={!person.fullName.trim() ? "bcs-warning-cell" : ""}><input aria-label={`П.І.Б., рядок ${personIndex + 1}`} value={person.fullName} onChange={(event) => updatePerson(block.id, personIndex, "fullName", event.target.value)} /></td>
                           <td><input aria-label={`Функціональні обов'язки, рядок ${personIndex + 1}`} value={person.duties} onChange={(event) => updatePerson(block.id, personIndex, "duties", event.target.value)} /></td>
-                          <td className={startedPerson && !person.location.trim() ? "bcs-warning-cell" : ""}>
+                          <td className={!person.location.trim() ? "bcs-warning-cell" : ""}>
                             <CustomSelect
                               ariaLabel={`Де знаходиться, рядок ${personIndex + 1}`}
                               value={person.location}
@@ -949,7 +950,6 @@ export default function BcsWorkspace({ variant }: Props) {
         <footer className="export-bar">
           <div>
             <b>{exportUnavailableReason ? "Експорт недоступний" : "Готово до експорту"}</b>
-            <span>{places} рядків у структурі · {authorizedStrength} за штатом (довідково)</span>
             {exportUnavailableReason && <span className="count-warning">{exportUnavailableReason}</span>}
             {tauriAvailable && (
               <span className={draftStatus === "error" ? "autosave-error" : "autosave-status"}>
@@ -1297,7 +1297,6 @@ export default function BcsWorkspace({ variant }: Props) {
       <footer className="export-bar">
         <div>
           <b>{exportUnavailableReason ? "Експорт недоступний" : isEditor ? "Готово до експорту" : "Шаблон буде з формулами та списками"}</b>
-          <span>{places} місць у структурі · {authorizedStrength} за штатом (довідково)</span>
           {exportUnavailableReason && <span className="count-warning">{exportUnavailableReason}</span>}
           {tauriAvailable && (
             <span className={draftStatus === "error" ? "autosave-error" : "autosave-status"}>

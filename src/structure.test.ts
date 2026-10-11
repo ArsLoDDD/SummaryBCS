@@ -52,10 +52,10 @@ describe("structure helpers", () => {
     ]);
   });
 
-  it("requires rank, name and location only after a person row is started", () => {
+  it("requires rank, name and location in every configured person row", () => {
     const blank = emptyPerson("crew");
     expect(personHasAnyData(blank)).toBe(false);
-    expect(missingRequiredPersonFields(blank)).toEqual([]);
+    expect(missingRequiredPersonFields(blank)).toEqual(["Звання", "П.І.Б.", "Де знаходиться"]);
 
     const partial = { ...blank, position: "Оператор", rank: "солдат" };
     expect(personHasAnyData(partial)).toBe(true);

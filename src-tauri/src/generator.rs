@@ -200,6 +200,7 @@ pub fn export_template(request: TemplateRequest) -> Result<String, String> {
         request.authorized_strength,
         request.blocks,
         Vec::new(),
+        false,
         request.output_path,
     )?;
     export_prepared(&prepared)
@@ -213,6 +214,7 @@ pub fn export_filled(request: FilledBcsRequest) -> Result<String, String> {
         request.authorized_strength,
         request.blocks,
         request.people,
+        true,
         request.output_path,
     )?;
     export_prepared(&prepared)
@@ -331,6 +333,7 @@ fn prepare(
     authorized_strength: u32,
     blocks: Vec<StructureBlock>,
     people: Vec<PersonInput>,
+    require_complete_people: bool,
     output_path: String,
 ) -> Result<PreparedRequest, String> {
     let schema = schema()?;
@@ -494,17 +497,7 @@ fn prepare(
             person.location = canonical_location(&person.location, &schema.locations)?;
         }
         person.note = validate_text(&person.note, "Примітка", 1_000, false)?;
-        let has_any_data = [
-            &person.position,
-            &person.rank,
-            &person.full_name,
-            &person.duties,
-            &person.location,
-            &person.note,
-        ]
-        .iter()
-        .any(|value| !value.trim().is_empty());
-        if has_any_data {
+        if require_complete_people {
             let mut missing = Vec::new();
             if person.rank.trim().is_empty() {
                 missing.push("Звання");
@@ -517,7 +510,7 @@ fn prepare(
             }
             if !missing.is_empty() {
                 return Err(format!(
-                    "Для кожної заповненої людини вкажіть: {}.",
+                    "Заповніть кожне створене місце. Для кожної людини вкажіть: {}.",
                     missing.join(", ")
                 ));
             }
@@ -530,6 +523,14 @@ fn prepare(
         if block.people.len() > block.slots {
             return Err(format!(
                 "Для блоку «{}» додано {} записів, але передбачено лише {} місць.",
+                block.name,
+                block.people.len(),
+                block.slots
+            ));
+        }
+        if require_complete_people && block.people.len() < block.slots {
+            return Err(format!(
+                "Заповніть усі створені місця. У блоці «{}» заповнено {} з {}. Обов’язково вкажіть: Звання, П.І.Б., Де знаходиться.",
                 block.name,
                 block.people.len(),
                 block.slots
@@ -1374,6 +1375,27 @@ mod tests {
         ]
     }
 
+    fn complete_people() -> Vec<PersonInput> {
+        [
+            ("management", "КОМАНДИРЕНКО Один"),
+            ("management", "СЕРЖАНТЕНКО Два"),
+            ("crew-1", "ІВАНОВ Три"),
+            ("crew-1", "ПЕТРЕНКО Чотири"),
+            ("crew-1", "СИДОРЕНКО П’ять"),
+        ]
+        .into_iter()
+        .map(|(block_id, full_name)| PersonInput {
+            block_id: block_id.into(),
+            position: String::new(),
+            rank: "солдат".into(),
+            full_name: full_name.into(),
+            duties: String::new(),
+            location: "На позиції".into(),
+            note: String::new(),
+        })
+        .collect()
+    }
+
     fn read_entry(path: &Path, name: &str) -> String {
         let file = File::open(path).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
@@ -1477,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_empty_bcs_with_default_block_names_and_blank_crew_details() {
+    fn exports_empty_template_with_default_block_names_and_blank_crew_details() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("empty.xlsx");
         let mut empty_blocks = blocks();
@@ -1489,13 +1511,12 @@ mod tests {
             block.uav_name.clear();
         }
 
-        export_filled(FilledBcsRequest {
+        export_template(TemplateRequest {
             unit_name: "1 РУБАК".into(),
             report_date: "08.10.2026".into(),
             structure_type: StructureType::Company,
             authorized_strength: 5,
             blocks: empty_blocks,
-            people: Vec::new(),
             output_path: path.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1506,7 +1527,54 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_started_person_without_rank_name_or_location() {
+    fn rejects_filled_export_when_created_people_slots_are_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty-filled.xlsx");
+        let people = ["management", "management", "crew-1", "crew-1", "crew-1"]
+            .into_iter()
+            .map(|block_id| PersonInput {
+                block_id: block_id.into(),
+                ..PersonInput::default()
+            })
+            .collect();
+        let error = export_filled(FilledBcsRequest {
+            unit_name: "1 РУБАК".into(),
+            report_date: "08.10.2026".into(),
+            structure_type: StructureType::Company,
+            authorized_strength: 5,
+            blocks: blocks(),
+            people,
+            output_path: path.to_string_lossy().into_owned(),
+        })
+        .unwrap_err();
+
+        assert!(error.contains("Заповніть кожне створене місце"));
+        assert!(error.contains("Звання, П.І.Б., Де знаходиться"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn rejects_filled_export_when_created_people_slots_are_omitted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("omitted-filled.xlsx");
+        let error = export_filled(FilledBcsRequest {
+            unit_name: "1 РУБАК".into(),
+            report_date: "08.10.2026".into(),
+            structure_type: StructureType::Company,
+            authorized_strength: 5,
+            blocks: blocks(),
+            people: Vec::new(),
+            output_path: path.to_string_lossy().into_owned(),
+        })
+        .unwrap_err();
+
+        assert!(error.contains("Заповніть усі створені місця"));
+        assert!(error.contains("Звання, П.І.Б., Де знаходиться"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn rejects_an_incomplete_person_without_rank_name_or_location() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("incomplete-person.xlsx");
         let error = export_filled(FilledBcsRequest {
@@ -1594,21 +1662,23 @@ mod tests {
     fn exports_filled_bcs_and_keeps_personal_values_as_plain_text() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("filled.xlsx");
+        let mut people = complete_people();
+        people[2] = PersonInput {
+            block_id: "crew-1".into(),
+            position: "Оператор".into(),
+            rank: "солдат".into(),
+            full_name: "іванов іВАН іванович".into(),
+            duties: "Оператор".into(),
+            location: "На позиції".into(),
+            note: "=НЕ ФОРМУЛА".into(),
+        };
         export_filled(FilledBcsRequest {
             unit_name: "ТЕСТОВИЙ ПІДРОЗДІЛ".into(),
             report_date: "08.10.2026".into(),
             structure_type: StructureType::Company,
             authorized_strength: 5,
             blocks: blocks(),
-            people: vec![PersonInput {
-                block_id: "crew-1".into(),
-                position: "Оператор".into(),
-                rank: "солдат".into(),
-                full_name: "іванов іВАН іванович".into(),
-                duties: "Оператор".into(),
-                location: "На позиції".into(),
-                note: "=НЕ ФОРМУЛА".into(),
-            }],
+            people,
             output_path: path.to_string_lossy().into_owned(),
         })
         .unwrap();
@@ -1622,21 +1692,23 @@ mod tests {
     fn exports_macro_free_one_sheet_bcs_without_helpers_and_keeps_nonzero_uav_rows() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("one-sheet.xlsx");
+        let mut people = complete_people();
+        people[2] = PersonInput {
+            block_id: "crew-1".into(),
+            position: "Оператор".into(),
+            rank: "солдат".into(),
+            full_name: "іванов іван іванович".into(),
+            duties: "Оператор БпАК".into(),
+            location: "На позиції".into(),
+            note: "Тест".into(),
+        };
         export_filled(FilledBcsRequest {
             unit_name: "1 РУБАК".into(),
             report_date: "08.10.2026".into(),
             structure_type: StructureType::Company,
             authorized_strength: 5,
             blocks: blocks(),
-            people: vec![PersonInput {
-                block_id: "crew-1".into(),
-                position: "Оператор".into(),
-                rank: "солдат".into(),
-                full_name: "іванов іван іванович".into(),
-                duties: "Оператор БпАК".into(),
-                location: "На позиції".into(),
-                note: "Тест".into(),
-            }],
+            people,
             output_path: path.to_string_lossy().into_owned(),
         })
         .unwrap();
