@@ -1592,9 +1592,7 @@ mod tests {
         assert!(sheet.contains("<c r=\"A12\" s=\"177\""));
         assert!(sheet.contains("Інші підрозділи"));
         assert!(!sheet.contains("ІНШІ ПІДРОЗДІЛИ"));
-        assert!(styles.contains(
-            "<fgColor rgb=\"FFD7E4BD\"/><bgColor indexed=\"64\"/>"
-        ));
+        assert!(styles.contains("<fgColor rgb=\"FFD7E4BD\"/><bgColor indexed=\"64\"/>"));
 
         other_blocks.push(StructureBlock {
             id: "other-duplicate".into(),
