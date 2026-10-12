@@ -1,0 +1,29 @@
+ВСТАНОВЛЕННЯ СЕРТИФІКАТА WINDOWS
+
+Усі EXE в цьому архіві мають цифровий підпис.
+
+Якщо у файлі SIGNING-INFO.txt вказано "Signing mode: trusted", сертифікат виданий
+довіреним або корпоративним центром. Зазвичай додаткових дій не потрібно.
+
+Якщо вказано "Signing mode: self-signed", перед запуском інсталятора потрібно
+додати SummaryBCS-Code-Signing.cer до довірених сертифікатів на цьому комп'ютері.
+
+Рекомендований спосіб для адміністратора або ІТ-служби:
+
+1. Відкрити PowerShell від імені адміністратора в папці з файлами архіву.
+2. Виконати дві команди:
+
+Import-Certificate -FilePath ".\SummaryBCS-Code-Signing.cer" -CertStoreLocation "Cert:\LocalMachine\Root"
+Import-Certificate -FilePath ".\SummaryBCS-Code-Signing.cer" -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher"
+
+Без прав адміністратора можна замінити LocalMachine на CurrentUser. Тоді довіра
+діятиме лише для поточного користувача Windows.
+
+Після встановлення сертифіката перевірити EXE можна командою:
+
+Get-AuthenticodeSignature ".\назва-інсталятора.exe" | Format-List Status, StatusMessage, SignerCertificate
+
+Очікуваний статус: Valid.
+
+ВАЖЛИВО: встановлюйте сертифікат лише з архіву, отриманого з контрольованої збірки
+цього проєкту. Файл .pfx і приватний ключ до архіву не додаються.

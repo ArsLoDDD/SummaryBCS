@@ -494,86 +494,93 @@ function validIsoDate(value: string): boolean {
     && date.getUTCDate() === day;
 }
 
-function crewProblem(crew: StripCrew, label: string): string {
-  if (missing(crew.name)) return `${label}: вкажіть назву екіпажу.`;
-  if (!crew.readiness) return `${label}: оберіть БГ екіпажу.`;
+function crewProblems(crew: StripCrew, label: string): string[] {
+  const problems: string[] = [];
+  if (missing(crew.name)) problems.push(`${label}: вкажіть назву екіпажу.`);
+  if (!crew.readiness) problems.push(`${label}: оберіть БГ екіпажу.`);
   if (crew.readiness === "Не БГ" && missing(crew.notReadyReason)) {
-    return `${label}: вкажіть причину статусу «Не БГ».`;
+    problems.push(`${label}: вкажіть причину статусу «Не БГ».`);
   }
   if (crew.readiness === "Формується" && crew.duty !== "Формується") {
-    return `${label}: для статусу «Формується» значення БЧ також має бути «Формується».`;
+    problems.push(`${label}: для статусу «Формується» значення БЧ також має бути «Формується».`);
   }
   if (crew.readiness !== "Формується" && !CREW_DUTIES.includes(crew.duty as typeof CREW_DUTIES[number])) {
-    return `${label}: оберіть БЧ або «Відпочинок після БЧ».`;
+    problems.push(`${label}: оберіть БЧ або «Відпочинок після БЧ».`);
   }
-  return "";
+  return problems;
 }
 
-export function validateStripsReport(report: StripsReport): string {
-  if (!validIsoDate(report.reportDate)) return "Оберіть правильну дату звіту.";
-  if (report.strips.length === 0) return "Додайте хоча б одну смугу.";
+export function validateStripsReportErrors(report: StripsReport): string[] {
+  const problems: string[] = [];
+  if (!validIsoDate(report.reportDate)) problems.push("Оберіть правильну дату звіту.");
+  if (report.strips.length === 0) problems.push("Додайте хоча б одну смугу.");
   const ids = new Set<string>();
-  const uniqueIdProblem = (value: string, label: string): string => {
-    if (missing(value)) return `${label}: службовий ідентифікатор відсутній.`;
-    if (ids.has(value)) return `${label}: виявлено повторений блок. Видаліть його та додайте заново.`;
+  const checkUniqueId = (value: string, label: string) => {
+    if (missing(value)) {
+      problems.push(`${label}: службовий ідентифікатор відсутній.`);
+      return;
+    }
+    if (ids.has(value)) {
+      problems.push(`${label}: виявлено повторений блок. Видаліть його та додайте заново.`);
+      return;
+    }
     ids.add(value);
-    return "";
   };
 
   for (const [stripIndex, strip] of report.strips.entries()) {
     const stripLabel = `Смуга ${stripIndex + 1}`;
-    let problem = uniqueIdProblem(strip.id, stripLabel);
-    if (problem) return problem;
-    if (missing(strip.name)) return `${stripLabel}: вкажіть назву.`;
-    if (strip.groups.length === 0) return `${strip.name}: додайте хоча б один блок підрозділу та типу БпЛА.`;
+    const stripName = missing(strip.name) ? stripLabel : strip.name;
+    checkUniqueId(strip.id, stripLabel);
+    if (missing(strip.name)) problems.push(`${stripLabel}: вкажіть назву.`);
+    if (strip.groups.length === 0) {
+      problems.push(`${stripName}: додайте хоча б один блок підрозділу та типу БпЛА.`);
+    }
 
     for (const [groupIndex, group] of strip.groups.entries()) {
-      const groupLabel = `${strip.name}, блок ${groupIndex + 1}`;
-      problem = uniqueIdProblem(group.id, groupLabel);
-      if (problem) return problem;
-      if (missing(group.unit)) return `${groupLabel}: вкажіть підрозділ.`;
-      if (!group.uavType) return `${groupLabel}: оберіть тип БпЛА.`;
+      const groupLabel = `${stripName}, блок ${groupIndex + 1}`;
+      checkUniqueId(group.id, groupLabel);
+      if (missing(group.unit)) problems.push(`${groupLabel}: вкажіть підрозділ.`);
+      if (!group.uavType) problems.push(`${groupLabel}: оберіть тип БпЛА.`);
       if (group.positions.length === 0 && group.looseCrews.length === 0) {
-        return `${groupLabel}: додайте позицію або екіпаж без позиції.`;
+        problems.push(`${groupLabel}: додайте позицію або екіпаж без позиції.`);
       }
 
       for (const [positionIndex, position] of group.positions.entries()) {
         const label = `${groupLabel}, позиція ${positionIndex + 1}`;
-        problem = uniqueIdProblem(position.id, label);
-        if (problem) return problem;
-        if (missing(position.name)) return `${label}: вкажіть назву позиції.`;
-        if (!position.readiness) return `${label}: оберіть БГ позиції.`;
+        checkUniqueId(position.id, label);
+        if (missing(position.name)) problems.push(`${label}: вкажіть назву позиції.`);
+        if (!position.readiness) problems.push(`${label}: оберіть БГ позиції.`);
         if (position.readiness === "Не БГ" && missing(position.notReadyReason)) {
-          return `${label}: вкажіть причину статусу «Не БГ».`;
+          problems.push(`${label}: вкажіть причину статусу «Не БГ».`);
         }
-        if (missing(position.bro)) return `${label}: вкажіть БРО.`;
-        if (missing(position.area)) return `${label}: вкажіть район.`;
-        if (missing(position.direction)) return `${label}: вкажіть напрямок роботи.`;
+        if (missing(position.bro)) problems.push(`${label}: вкажіть БРО.`);
+        if (missing(position.area)) problems.push(`${label}: вкажіть район.`);
+        if (missing(position.direction)) problems.push(`${label}: вкажіть напрямок роботи.`);
         for (const [crewIndex, crew] of position.crews.entries()) {
           const crewLabel = `${label}, екіпаж ${crewIndex + 1}`;
-          problem = uniqueIdProblem(crew.id, crewLabel);
-          if (problem) return problem;
-          problem = crewProblem(crew, crewLabel);
-          if (problem) return problem;
+          checkUniqueId(crew.id, crewLabel);
+          problems.push(...crewProblems(crew, crewLabel));
           if (crew.readiness === "Формується") {
-            return `${crewLabel}: екіпаж, що формується, не може бути закріплений за позицією.`;
+            problems.push(`${crewLabel}: екіпаж, що формується, не може бути закріплений за позицією.`);
           }
-          if (crew.readiness !== position.readiness) {
-            return `${crewLabel}: статус екіпажу має збігатися зі статусом позиції.`;
+          if (crew.readiness && position.readiness && crew.readiness !== position.readiness) {
+            problems.push(`${crewLabel}: статус екіпажу має збігатися зі статусом позиції.`);
           }
         }
       }
 
       for (const [crewIndex, crew] of group.looseCrews.entries()) {
         const label = `${groupLabel}, екіпаж без позиції ${crewIndex + 1}`;
-        problem = uniqueIdProblem(crew.id, label);
-        if (problem) return problem;
-        problem = crewProblem(crew, label);
-        if (problem) return problem;
+        checkUniqueId(crew.id, label);
+        problems.push(...crewProblems(crew, label));
       }
     }
   }
-  return "";
+  return problems;
+}
+
+export function validateStripsReport(report: StripsReport): string {
+  return validateStripsReportErrors(report).join("\n");
 }
 
 function emptyCounts(): StatusCounts {

@@ -69,7 +69,9 @@ npm run tauri:build:strips
 
 Вони створюють окремі виконувані файли `SummaryBCS.exe`, `BCSTemplateBuilder.exe`, `BCSEditor.exe` і `StripsEditor.exe`. Є також короткі команди `npm run build:exe:summary`, `npm run build:exe:template`, `npm run build:exe:editor` і `npm run build:exe:strips`.
 
-У GitHub workflow **Windows EXE — збірка** автоматично запускається після кожного push у `main`; його також можна запустити вручну через `workflow_dispatch`. Він збирає «Зведення БЧС», «Редактор БЧС» і «Редактор позицій по смугах». Після завершення доступні три окремі ZIP-артефакти: `BCS-Windows-Summary`, `BCS-Windows-Editor` і `BCS-Windows-Strips`; кожен містить один NSIS `.exe`. «Шаблон БЧС» у GitHub Actions поки не збирається. Pull request запускає лише перевірки без Windows-інсталяторів.
+У GitHub workflow **Windows EXE — збірка** автоматично запускається після кожного push у `main`; його також можна запустити вручну через `workflow_dispatch`. Він збирає «Зведення БЧС», «Редактор БЧС» і «Редактор позицій по смугах». Після завершення доступні три окремі ZIP-артефакти: `BCS-Windows-Summary`, `BCS-Windows-Editor` і `BCS-Windows-Strips`. Кожен містить NSIS `.exe`, публічний сертифікат `.cer`, відомості про підпис та інструкцію встановлення сертифіката. «Шаблон БЧС» у GitHub Actions поки не збирається. Pull request запускає лише перевірки без Windows-інсталяторів.
+
+Кожен Windows EXE — як файл програми, так і NSIS-інсталятор — обов’язково підписується Authenticode із SHA-256 та міткою часу. Якщо PFX не заданий у GitHub Secrets, workflow автоматично створює резервний самопідписаний Code Signing-сертифікат; непідписаний артефакт не публікується. Для довіри до такого підпису вкладений `.cer` треба встановити на робочому ПК. Спільна політика успадковується всіма теперішніми та майбутніми Tauri-варіантами програми. Деталі описані в [docs/WINDOWS_CODE_SIGNING.md](docs/WINDOWS_CODE_SIGNING.md).
 
 ## Редактор позицій по смугах
 

@@ -35,7 +35,7 @@ import {
   setCrewReadinessInGroup,
   setPositionReadinessInGroup,
   upperUk,
-  validateStripsReport,
+  validateStripsReportErrors,
   type CrewDuty,
   type CrewReadiness,
   type PositionReadiness,
@@ -69,6 +69,15 @@ function messageFrom(error: unknown): string {
 
 function cleanAssets(value: string): string {
   return value.split(",").map((item) => item.trim()).filter(Boolean).join(", ");
+}
+
+function validationCountLabel(count: number): string {
+  const lastTwo = count % 100;
+  const last = count % 10;
+  if (lastTwo >= 11 && lastTwo <= 14) return `${count} помилок`;
+  if (last === 1) return `${count} помилка`;
+  if (last >= 2 && last <= 4) return `${count} помилки`;
+  return `${count} помилок`;
 }
 
 function Notification({ kind, children }: { kind: "error" | "success"; children: ReactNode }) {
@@ -460,6 +469,31 @@ function SummaryTables({ summary }: { summary: ReturnType<typeof calculateStrips
   );
 }
 
+function StripSummaryRow({ strip }: { strip: WorkStrip }) {
+  const summary = calculateStripsSummary([strip]);
+  return (
+    <table className="strips-strip-summary" aria-label={`Підсумок смуги ${strip.name || "без назви"}`}>
+      <thead>
+        <tr><th>Показник</th><th>Всього</th><th className="status-ready">БГ</th><th className="status-not-ready">Не БГ</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th>Екіпажі</th>
+          <td>{summary.crewTotals.total}</td>
+          <td className="status-ready">{summary.crewTotals.ready}</td>
+          <td className="status-not-ready">{summary.crewTotals.notReady}</td>
+        </tr>
+        <tr>
+          <th>Позиції</th>
+          <td>{summary.positionTotals.total}</td>
+          <td className="status-ready">{summary.positionTotals.ready}</td>
+          <td className="status-not-ready">{summary.positionTotals.notReady}</td>
+        </tr>
+      </tbody>
+    </table>
+  );
+}
+
 export default function StripsWorkspace() {
   const [report, setReport] = useState<StripsReport>(() => ({
     version: 1,
@@ -476,7 +510,7 @@ export default function StripsWorkspace() {
   const [draftReady, setDraftReady] = useState(false);
   const [draftStatus, setDraftStatus] = useState<"saved" | "saving" | "error">("saved");
   const tauriAvailable = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-  const validationError = useMemo(() => validateStripsReport(report), [report]);
+  const validationErrors = useMemo(() => validateStripsReportErrors(report), [report]);
   const summary = useMemo(() => calculateStripsSummary(report.strips), [report.strips]);
   const uavOptions = UAV_TYPES.map((value) => ({ value, label: value }));
   const pendingLinkContext = useMemo(() => {
@@ -701,8 +735,8 @@ export default function StripsWorkspace() {
   }
 
   async function exportWorkbook() {
-    if (validationError) {
-      setError(validationError);
+    if (validationErrors.length > 0) {
+      setError(`Виправте всі помилки перед експортом (${validationErrors.length}):\n${validationErrors.map((problem) => `• ${problem}`).join("\n")}`);
       return;
     }
     const outputPath = await save({
@@ -1012,6 +1046,7 @@ export default function StripsWorkspace() {
                     })}
                   </tbody>
                 </table>
+                <StripSummaryRow strip={strip} />
               </section>
             ))}
 
@@ -1022,8 +1057,12 @@ export default function StripsWorkspace() {
 
       <footer className="export-bar strips-export-bar">
         <div>
-          <b>{validationError ? "Експорт недоступний" : "Готово до експорту"}</b>
-          {validationError && <span className="count-warning">{validationError}</span>}
+          <b>{validationErrors.length > 0 ? `Експорт недоступний: ${validationCountLabel(validationErrors.length)}` : "Готово до експорту"}</b>
+          {validationErrors.length > 0 && (
+            <ol className="strips-validation-list">
+              {validationErrors.map((problem, index) => <li key={`${index}-${problem}`}>{problem}</li>)}
+            </ol>
+          )}
           {tauriAvailable && (
             <span className={draftStatus === "error" ? "autosave-error" : "autosave-status"}>
               {draftStatus === "saving" && "Зберігаю зміни…"}
@@ -1032,7 +1071,7 @@ export default function StripsWorkspace() {
             </span>
           )}
         </div>
-        <button className="primary-button" onClick={exportWorkbook} disabled={busy || Boolean(validationError)} title={validationError || undefined}>
+        <button className="primary-button" onClick={exportWorkbook} disabled={busy || validationErrors.length > 0} title={validationErrors.join("\n") || undefined}>
           {busy ? <LoaderCircle className="spin" size={18} /> : <Download size={18} />}
           Зберегти у XLSX
         </button>

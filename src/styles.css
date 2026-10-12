@@ -135,6 +135,7 @@ button:disabled {
   font-weight: 600;
   text-align: center;
   overflow-wrap: anywhere;
+  white-space: pre-line;
 }
 
 .message.error {
@@ -1746,6 +1747,29 @@ button:disabled {
 .strips-editor-table td.strips-status-band.status-forming { background: #fdeada; }
 .strips-warning-cell { box-shadow: inset 0 0 0 2px #c65911; }
 
+.strips-strip-summary {
+  width: 760px;
+  table-layout: fixed;
+  margin: 10px 0 0;
+  border-collapse: collapse;
+  color: #000000;
+  background: #ffffff;
+  font: 700 14.7px/1.15 "Times New Roman", Times, serif;
+}
+.strips-strip-summary th,
+.strips-strip-summary td {
+  width: 25%;
+  height: 34px;
+  padding: 5px 7px;
+  border: 1px solid #000000;
+  text-align: center;
+  vertical-align: middle;
+}
+.strips-strip-summary th { background: #dbeef4; }
+.strips-strip-summary td { font-weight: 700; }
+.strips-strip-summary .status-ready { background: #d7e48d; }
+.strips-strip-summary .status-not-ready { background: #e6b8b7; }
+
 .strips-input-actions,
 .strips-position-cell,
 .strips-group-cell {
@@ -1838,6 +1862,16 @@ button:disabled {
 .strips-summary tbody th { text-align: center; }
 .strips-summary .strips-total-row > * { background: #d7e4bd; font-weight: 700; }
 .strips-export-bar { position: static; flex: 0 0 auto; margin-top: 12px; }
+.strips-validation-list {
+  max-height: 112px;
+  margin: 3px 0 0;
+  padding: 0 8px 0 24px;
+  overflow-y: auto;
+  color: #b54708;
+  font-size: 12px;
+  line-height: 1.35;
+}
+.strips-validation-list li { padding: 1px 0; }
 
 .reason-modal-backdrop {
   position: fixed;

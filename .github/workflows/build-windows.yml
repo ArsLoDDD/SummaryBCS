@@ -27,6 +27,20 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: npm ci
+      - name: Перевірити Windows-скрипт підпису
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "src-tauri/sign-windows.ps1"),
+            [ref]$tokens,
+            [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | ForEach-Object { Write-Error $_.Message }
+            throw "Windows-скрипт підпису містить синтаксичні помилки."
+          }
       - name: Перевірити всі робочі версії
         run: npm run test:ci
 
@@ -41,12 +55,15 @@ jobs:
           - app: Summary
             build_command: npm run tauri:build:summary
             artifact_name: BCS-Windows-Summary
+            binary_name: SummaryBCS
           - app: Editor
             build_command: npm run tauri:build:editor
             artifact_name: BCS-Windows-Editor
+            binary_name: BCSEditor
           - app: Strips
             build_command: npm run tauri:build:strips
             artifact_name: BCS-Windows-Strips
+            binary_name: StripsEditor
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -55,20 +72,132 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
+      - name: Підготувати сертифікат підпису
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificateDirectory = Join-Path $env:RUNNER_TEMP "summarybcs-code-signing"
+          $certificatePath = Join-Path $certificateDirectory "code-signing.pfx"
+          $publicCertificatePath = Join-Path $certificateDirectory "SummaryBCS-Code-Signing.cer"
+          New-Item -ItemType Directory -Path $certificateDirectory -Force | Out-Null
+
+          $hasCertificate = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)
+          $hasPassword = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)
+          if ($hasCertificate -xor $hasPassword) {
+            throw "WINDOWS_CERTIFICATE і WINDOWS_CERTIFICATE_PASSWORD мають бути задані разом."
+          }
+
+          if ($hasCertificate) {
+            $base64 = $env:WINDOWS_CERTIFICATE `
+              -replace "-----BEGIN [^-]+-----", "" `
+              -replace "-----END [^-]+-----", "" `
+              -replace "\s", ""
+            try {
+              [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($base64))
+            } catch {
+              throw "WINDOWS_CERTIFICATE не є коректним Base64-вмістом PFX."
+            }
+            $certificatePassword = $env:WINDOWS_CERTIFICATE_PASSWORD
+            $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              $certificatePath,
+              $certificatePassword,
+              [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+            )
+            $signingMode = "trusted"
+          } else {
+            $certificatePassword = [guid]::NewGuid().ToString("N")
+            $securePassword = ConvertTo-SecureString -String $certificatePassword -AsPlainText -Force
+            $certificate = New-SelfSignedCertificate `
+              -Type CodeSigningCert `
+              -Subject "CN=SummaryBCS Local Code Signing" `
+              -FriendlyName "SummaryBCS Local Code Signing" `
+              -CertStoreLocation "Cert:\CurrentUser\My" `
+              -KeyAlgorithm RSA `
+              -KeyLength 3072 `
+              -HashAlgorithm SHA256 `
+              -KeyExportPolicy Exportable `
+              -KeySpec Signature `
+              -NotAfter (Get-Date).AddYears(3)
+            Export-PfxCertificate -Cert $certificate -FilePath $certificatePath -Password $securePassword | Out-Null
+            $signingMode = "self-signed"
+            Write-Warning "PFX secrets are absent. A self-signed Code Signing certificate was generated."
+          }
+
+          if (-not $certificate.HasPrivateKey) {
+            throw "PFX не містить приватного ключа."
+          }
+          $codeSigningOid = "1.3.6.1.5.5.7.3.3"
+          $enhancedKeyUsage = $certificate.Extensions |
+            Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } |
+            ForEach-Object { $_.EnhancedKeyUsages } |
+            Where-Object { $_.Value -eq $codeSigningOid }
+          if ($null -eq $enhancedKeyUsage) {
+            throw "Сертифікат не призначений для Windows Code Signing."
+          }
+          $now = Get-Date
+          if ($now -lt $certificate.NotBefore -or $now -gt $certificate.NotAfter) {
+            throw "Сертифікат ще не чинний або вже прострочений."
+          }
+          Export-Certificate -Cert $certificate -FilePath $publicCertificatePath -Type CERT | Out-Null
+          if ($signingMode -eq "self-signed") {
+            Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
+            Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
+          }
+          "WINDOWS_CERTIFICATE_PATH=$certificatePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "WINDOWS_CERTIFICATE_PASSWORD=$certificatePassword" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "WINDOWS_SIGNING_PUBLIC_CERTIFICATE=$publicCertificatePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "WINDOWS_SIGNING_MODE=$signingMode" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Сертифікат перевірено: $($certificate.Subject)"
+          Write-Host "Відбиток: $($certificate.Thumbprint)"
+          Write-Host "Чинний до: $($certificate.NotAfter.ToString('u'))"
+          Write-Host "Режим підпису: $signingMode"
       - name: Зібрати ${{ matrix.app }}
+        env:
+          WINDOWS_TIMESTAMP_URL: https://timestamp.digicert.com
         run: ${{ matrix.build_command }}
-      - name: Підготувати EXE
+      - name: Перевірити підпис і підготувати EXE
         shell: pwsh
         run: |
           $installers = @(Get-ChildItem "src-tauri/target/release/bundle/nsis" -Filter "*.exe" -File)
           if ($installers.Count -ne 1) {
             throw "Очікувався рівно один NSIS EXE, знайдено: $($installers.Count)"
           }
+          $application = Get-Item "src-tauri/target/release/${{ matrix.binary_name }}.exe"
+          $signedFiles = @($application, $installers[0])
+          $thumbprints = @()
+          foreach ($file in $signedFiles) {
+            $signature = Get-AuthenticodeSignature -FilePath $file.FullName
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+              throw "Некоректний Authenticode-підпис $($file.Name): $($signature.Status) — $($signature.StatusMessage)"
+            }
+            if ($null -eq $signature.TimeStamperCertificate) {
+              throw "Файл не має мітки часу: $($file.Name)"
+            }
+            $thumbprints += $signature.SignerCertificate.Thumbprint
+            Write-Host "Підпис підтверджено: $($file.Name) — $($signature.SignerCertificate.Subject)"
+          }
+          if (@($thumbprints | Select-Object -Unique).Count -ne 1) {
+            throw "Програма та інсталятор підписані різними сертифікатами."
+          }
           New-Item -ItemType Directory -Path "windows-artifact" -Force | Out-Null
           Copy-Item -LiteralPath $installers[0].FullName -Destination "windows-artifact/$($installers[0].Name)"
+          Copy-Item -LiteralPath $env:WINDOWS_SIGNING_PUBLIC_CERTIFICATE -Destination "windows-artifact/SummaryBCS-Code-Signing.cer"
+          Copy-Item -LiteralPath "docs/INSTALL-CERTIFICATE.txt" -Destination "windows-artifact/INSTALL-CERTIFICATE.txt"
+          Set-Content -LiteralPath "windows-artifact/SIGNING-INFO.txt" -Encoding utf8 -Value @(
+            "Signing mode: $env:WINDOWS_SIGNING_MODE"
+            "Certificate subject: $($signature.SignerCertificate.Subject)"
+            "Certificate thumbprint: $($signature.SignerCertificate.Thumbprint)"
+            "Certificate valid until: $($signature.SignerCertificate.NotAfter.ToString('u'))"
+          )
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: windows-artifact/*.exe
+          path: windows-artifact/*
           if-no-files-found: error
           retention-days: 14
+      - name: Видалити тимчасовий PFX
+        if: always()
+        shell: pwsh
+        run: Remove-Item -LiteralPath "${{ runner.temp }}\summarybcs-code-signing" -Recurse -Force -ErrorAction SilentlyContinue

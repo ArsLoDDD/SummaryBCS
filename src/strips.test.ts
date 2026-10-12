@@ -14,6 +14,7 @@ import {
   readinessDisplay,
   setCrewReadinessInGroup,
   validateStripsReport,
+  validateStripsReportErrors,
   type StripsReport,
 } from "./strips";
 
@@ -177,6 +178,41 @@ describe("strips report", () => {
     position.crews.push(position.crews[0]);
     expect(validateStripsReport(report)).toContain("повторений блок");
     expect(calculateStripsSummary(report.strips).crewTotals.total).toBe(1);
+  });
+
+  it("returns every validation error at once", () => {
+    const report = validReport();
+    const group = report.strips[0].groups[0];
+    const position = group.positions[0];
+    const crew = position.crews[0];
+    report.strips[0].name = "";
+    group.unit = "";
+    group.uavType = "";
+    position.name = "";
+    position.readiness = "";
+    position.bro = "";
+    position.area = "";
+    position.direction = "";
+    crew.name = "";
+    crew.readiness = "";
+    crew.duty = "";
+
+    const problems = validateStripsReportErrors(report);
+    expect(problems).toHaveLength(11);
+    expect(problems).toEqual(expect.arrayContaining([
+      expect.stringContaining("вкажіть назву"),
+      expect.stringContaining("вкажіть підрозділ"),
+      expect.stringContaining("оберіть тип БпЛА"),
+      expect.stringContaining("вкажіть назву позиції"),
+      expect.stringContaining("оберіть БГ позиції"),
+      expect.stringContaining("вкажіть БРО"),
+      expect.stringContaining("вкажіть район"),
+      expect.stringContaining("вкажіть напрямок роботи"),
+      expect.stringContaining("вкажіть назву екіпажу"),
+      expect.stringContaining("оберіть БГ екіпажу"),
+      expect.stringContaining("оберіть БЧ"),
+    ]));
+    expect(validateStripsReport(report).split("\n")).toEqual(problems);
   });
 
   it("normalizes restored data and rejects impossible dates", () => {

@@ -34,9 +34,10 @@
     "tauri:build:strips": "tauri build --config src-tauri/tauri.strips.conf.json --bundles nsis",
     "test": "vitest run",
     "lint": "eslint src --max-warnings=0",
+    "check:signing": "node scripts/check-windows-signing.mjs",
     "check:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml --check && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
-    "test:ci": "npm run lint && npm run test && npm run build:ci && npm run check:rust && cargo test --manifest-path src-tauri/Cargo.toml",
-    "test:full": "npm run lint && npm run test && npm run build:all && npm run check:rust && cargo test --manifest-path src-tauri/Cargo.toml"
+    "test:ci": "npm run lint && npm run test && npm run check:signing && npm run build:ci && npm run check:rust && cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:full": "npm run lint && npm run test && npm run check:signing && npm run build:all && npm run check:rust && cargo test --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

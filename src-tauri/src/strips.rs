@@ -691,6 +691,9 @@ fn build_sheet(report: &PreparedReport, summary: &StripsSummary) -> String {
             write_group(&mut rows, &mut merges, &mut row, group);
         }
 
+        let strip_summary = calculate_summary(std::slice::from_ref(strip));
+        write_strip_summary(&mut rows, row, &strip_summary);
+        row += 3;
         push_blank_row(&mut rows, row);
         row += 1;
         push_blank_row(&mut rows, row);
@@ -731,6 +734,44 @@ fn write_data_header(rows: &mut String, row: usize) {
         .map(|(column, header)| text_cell(column, row, header, STYLE_HEADER))
         .collect::<Vec<_>>();
     push_row(rows, row, 44, &cells);
+}
+
+fn write_strip_summary(rows: &mut String, row: usize, summary: &StripsSummary) {
+    let header = [
+        text_cell(0, row, "Показник", STYLE_SUMMARY_HEADER),
+        text_cell(1, row, "Всього", STYLE_SUMMARY_HEADER),
+        text_cell(2, row, "БГ", STYLE_READY),
+        text_cell(3, row, "Не БГ", STYLE_NOT_READY),
+    ];
+    push_row(rows, row, 34, &header);
+
+    let crew_row = row + 1;
+    let crews = [
+        text_cell(0, crew_row, "Екіпажі", STYLE_SUMMARY_LABEL),
+        number_cell(1, crew_row, summary.crew_totals.total, STYLE_SUMMARY_NUMBER),
+        number_cell(2, crew_row, summary.crew_totals.ready, STYLE_READY),
+        number_cell(3, crew_row, summary.crew_totals.not_ready, STYLE_NOT_READY),
+    ];
+    push_row(rows, crew_row, 30, &crews);
+
+    let position_row = row + 2;
+    let positions = [
+        text_cell(0, position_row, "Позиції", STYLE_SUMMARY_LABEL),
+        number_cell(
+            1,
+            position_row,
+            summary.position_totals.total,
+            STYLE_SUMMARY_NUMBER,
+        ),
+        number_cell(2, position_row, summary.position_totals.ready, STYLE_READY),
+        number_cell(
+            3,
+            position_row,
+            summary.position_totals.not_ready,
+            STYLE_NOT_READY,
+        ),
+    ];
+    push_row(rows, position_row, 30, &positions);
 }
 
 fn write_group(
@@ -1586,6 +1627,13 @@ mod tests {
         assert!(sheet.contains("Позиція без екіпажу"));
         assert!(sheet.contains("Екіпаж без позиції"));
         assert!(sheet.matches("Формується").count() >= 7);
+        assert!(sheet.contains("Показник"));
+        assert!(sheet.contains("<t xml:space=\"preserve\">Екіпажі</t>"));
+        assert!(sheet.contains("<t xml:space=\"preserve\">Позиції</t>"));
+        assert!(sheet.contains("<c r=\"B11\" s=\"16\"><v>3</v></c>"));
+        assert!(sheet.contains("<c r=\"D11\" s=\"8\"><v>2</v></c>"));
+        assert!(sheet.contains("<c r=\"B12\" s=\"16\"><v>1</v></c>"));
+        assert!(sheet.contains("<c r=\"D12\" s=\"8\"><v>1</v></c>"));
         assert!(sheet.contains("Екіпажі за типом БпЛА"));
         assert!(sheet.contains("ДОВІДКОВО: ЗАПИСИ БЕЗ ЗВ’ЯЗКУ"));
         assert!(!sheet.contains("НЕ ВХОДЯТЬ В ОСНОВНИЙ ПІДСУМОК"));
@@ -1617,7 +1665,13 @@ mod tests {
         let prepared = prepare_request(value).unwrap();
         let sheet = build_sheet(&prepared, &calculate_summary(&prepared.strips));
 
-        assert!(sheet.contains("</row><row r=\"8\"/><row r=\"9\"/><row r=\"10\" ht=\"24\""));
+        assert_eq!(
+            sheet
+                .matches("<t xml:space=\"preserve\">Екіпажі</t>")
+                .count(),
+            2
+        );
+        assert!(sheet.contains("</row><row r=\"11\"/><row r=\"12\"/><row r=\"13\" ht=\"24\""));
     }
 
     #[test]
