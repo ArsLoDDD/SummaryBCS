@@ -29,8 +29,11 @@ if (/[^\x00-\x7F]/.test(signingScript)) {
 
 for (const requiredFragment of [
   "/fd SHA256",
-  "/tr $timestampUrl",
+  "timestamp `",
+  "/tr $activeTimestampUrl",
   "/td SHA256",
+  "http://timestamp.digicert.com",
+  "$attempt -le 3",
   "verify /pa /all",
   "TimeStamperCertificate",
 ]) {

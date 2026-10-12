@@ -17,7 +17,7 @@ if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
 $certificatePath = (Resolve-Path -LiteralPath $env:WINDOWS_CERTIFICATE_PATH).Path
 $targetPath = (Resolve-Path -LiteralPath $FilePath).Path
 $timestampUrl = if ([string]::IsNullOrWhiteSpace($env:WINDOWS_TIMESTAMP_URL)) {
-    "https://timestamp.digicert.com"
+    "http://timestamp.digicert.com"
 } else {
     $env:WINDOWS_TIMESTAMP_URL
 }
@@ -40,8 +40,6 @@ if ($null -ne $signToolCommand) {
 
 & $signToolPath sign `
     /fd SHA256 `
-    /tr $timestampUrl `
-    /td SHA256 `
     /f $certificatePath `
     /p $env:WINDOWS_CERTIFICATE_PASSWORD `
     /v `
@@ -49,6 +47,32 @@ if ($null -ne $signToolCommand) {
 
 if ($LASTEXITCODE -ne 0) {
     throw "SignTool failed to sign the file: $targetPath"
+}
+
+$timestampUrls = @($timestampUrl, "http://timestamp.digicert.com") | Select-Object -Unique
+$timestampSucceeded = $false
+foreach ($activeTimestampUrl in $timestampUrls) {
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        & $signToolPath timestamp `
+            /tr $activeTimestampUrl `
+            /td SHA256 `
+            /v `
+            $targetPath
+        if ($LASTEXITCODE -eq 0) {
+            $timestampSucceeded = $true
+            break
+        }
+        if ($attempt -lt 3) {
+            Start-Sleep -Seconds 2
+        }
+    }
+    if ($timestampSucceeded) {
+        break
+    }
+}
+
+if (-not $timestampSucceeded) {
+    throw "SignTool failed to timestamp the file: $targetPath"
 }
 
 & $signToolPath verify /pa /all /v $targetPath

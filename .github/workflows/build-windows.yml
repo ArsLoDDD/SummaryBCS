@@ -175,7 +175,7 @@ jobs:
           Remove-Item -LiteralPath $probeDirectory -Recurse -Force
       - name: Зібрати ${{ matrix.app }}
         env:
-          WINDOWS_TIMESTAMP_URL: https://timestamp.digicert.com
+          WINDOWS_TIMESTAMP_URL: http://timestamp.digicert.com
         run: ${{ matrix.build_command }}
       - name: Перевірити підпис і підготувати EXE
         shell: pwsh

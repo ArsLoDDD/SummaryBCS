@@ -58,7 +58,7 @@ Import-Certificate -FilePath ".\SummaryBCS-Code-Signing.cer" -CertStoreLocation 
 ```powershell
 $env:WINDOWS_CERTIFICATE_PATH = "C:\secure\code-signing.pfx"
 $env:WINDOWS_CERTIFICATE_PASSWORD = "пароль-pfx"
-$env:WINDOWS_TIMESTAMP_URL = "https://timestamp.digicert.com"
+$env:WINDOWS_TIMESTAMP_URL = "http://timestamp.digicert.com"
 
 npm run tauri:build:summary
 npm run tauri:build:editor
