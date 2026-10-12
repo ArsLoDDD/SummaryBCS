@@ -19,7 +19,7 @@ if (signCommand?.cmd !== "powershell.exe") {
 }
 
 const args = Array.isArray(signCommand?.args) ? signCommand.args : [];
-if (!args.includes("sign-windows.ps1") || !args.includes("%1")) {
+if (!args.some((arg) => arg.endsWith("src-tauri/sign-windows.ps1")) || !args.includes("%1")) {
   fail("команда підпису має викликати sign-windows.ps1 і передавати шлях через %1.");
 }
 
@@ -43,6 +43,8 @@ for (const requiredFragment of [
   "SummaryBCS-Code-Signing.cer",
   "WINDOWS_SIGNING_MODE=$signingMode",
   "SignerCertificate.Thumbprint -ne $expectedCertificate.Thumbprint",
+  "Перевірити підпис до основної збірки",
+  "scripts/signing-probe.rs",
   "path: windows-artifact/*",
 ]) {
   if (!workflow.includes(requiredFragment)) {

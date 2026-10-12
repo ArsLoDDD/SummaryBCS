@@ -149,6 +149,30 @@ jobs:
           Write-Host "Відбиток: $($certificate.Thumbprint)"
           Write-Host "Чинний до: $($certificate.NotAfter.ToString('u'))"
           Write-Host "Режим підпису: $signingMode"
+      - name: Перевірити підпис до основної збірки
+        shell: pwsh
+        run: |
+          $probeDirectory = Join-Path $env:RUNNER_TEMP "summarybcs-signing-probe"
+          $probePath = Join-Path $probeDirectory "signing-probe.exe"
+          $signingScript = (Resolve-Path "src-tauri/sign-windows.ps1").Path
+          New-Item -ItemType Directory -Path $probeDirectory -Force | Out-Null
+          rustc "scripts/signing-probe.rs" -o $probePath
+          if ($LASTEXITCODE -ne 0) {
+            throw "Не вдалося створити тестовий EXE для перевірки підпису."
+          }
+
+          & powershell.exe `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -ExecutionPolicy Bypass `
+            -File $signingScript `
+            $probePath
+          if ($LASTEXITCODE -ne 0) {
+            throw "Попередня перевірка Windows-підпису завершилася помилкою."
+          }
+          Write-Host "Попередня перевірка підпису успішна. Основну збірку можна починати."
+          Remove-Item -LiteralPath $probeDirectory -Recurse -Force
       - name: Зібрати ${{ matrix.app }}
         env:
           WINDOWS_TIMESTAMP_URL: https://timestamp.digicert.com
