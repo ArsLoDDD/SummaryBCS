@@ -52,6 +52,11 @@ for (const requiredFragment of [
   "SignerCertificate.Thumbprint -ne $expectedCertificate.Thumbprint",
   "Перевірити підпис до основної збірки",
   "scripts/signing-probe.rs",
+  "compile_command: npm run tauri -- build --no-bundle --no-sign",
+  "--bundles nsis --no-sign --no-binary-patching",
+  "Підписати програму ${{ matrix.app }}",
+  "Підписати інсталятор і підготувати EXE",
+  "-File $signingScript",
   "path: windows-artifact/*",
 ]) {
   if (!workflow.includes(requiredFragment)) {

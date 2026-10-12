@@ -48,20 +48,25 @@ jobs:
     needs: verify
     runs-on: windows-latest
     timeout-minutes: 60
+    env:
+      WINDOWS_TIMESTAMP_URL: http://timestamp.digicert.com
     strategy:
       fail-fast: false
       matrix:
         include:
           - app: Summary
-            build_command: npm run tauri:build:summary
+            compile_command: npm run tauri -- build --no-bundle --no-sign
+            bundle_command: npm run tauri -- bundle --bundles nsis --no-sign --no-binary-patching
             artifact_name: BCS-Windows-Summary
             binary_name: SummaryBCS
           - app: Editor
-            build_command: npm run tauri:build:editor
+            compile_command: npm run tauri -- build --config src-tauri/tauri.editor.conf.json --no-bundle --no-sign
+            bundle_command: npm run tauri -- bundle --config src-tauri/tauri.editor.conf.json --bundles nsis --no-sign --no-binary-patching
             artifact_name: BCS-Windows-Editor
             binary_name: BCSEditor
           - app: Strips
-            build_command: npm run tauri:build:strips
+            compile_command: npm run tauri -- build --config src-tauri/tauri.strips.conf.json --no-bundle --no-sign
+            bundle_command: npm run tauri -- bundle --config src-tauri/tauri.strips.conf.json --bundles nsis --no-sign --no-binary-patching
             artifact_name: BCS-Windows-Strips
             binary_name: StripsEditor
     steps:
@@ -173,11 +178,26 @@ jobs:
           }
           Write-Host "Попередня перевірка підпису успішна. Основну збірку можна починати."
           Remove-Item -LiteralPath $probeDirectory -Recurse -Force
-      - name: Зібрати ${{ matrix.app }}
-        env:
-          WINDOWS_TIMESTAMP_URL: http://timestamp.digicert.com
-        run: ${{ matrix.build_command }}
-      - name: Перевірити підпис і підготувати EXE
+      - name: Зібрати програму ${{ matrix.app }}
+        run: ${{ matrix.compile_command }}
+      - name: Підписати програму ${{ matrix.app }}
+        shell: pwsh
+        run: |
+          $application = (Resolve-Path "src-tauri/target/release/${{ matrix.binary_name }}.exe").Path
+          $signingScript = (Resolve-Path "src-tauri/sign-windows.ps1").Path
+          & powershell.exe `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -ExecutionPolicy Bypass `
+            -File $signingScript `
+            $application
+          if ($LASTEXITCODE -ne 0) {
+            throw "Не вдалося підписати файл програми: $application"
+          }
+      - name: Створити інсталятор ${{ matrix.app }}
+        run: ${{ matrix.bundle_command }}
+      - name: Підписати інсталятор і підготувати EXE
         shell: pwsh
         run: |
           $installers = @(Get-ChildItem "src-tauri/target/release/bundle/nsis" -Filter "*.exe" -File)
@@ -185,6 +205,17 @@ jobs:
             throw "Очікувався рівно один NSIS EXE, знайдено: $($installers.Count)"
           }
           $application = Get-Item "src-tauri/target/release/${{ matrix.binary_name }}.exe"
+          $signingScript = (Resolve-Path "src-tauri/sign-windows.ps1").Path
+          & powershell.exe `
+            -NoLogo `
+            -NoProfile `
+            -NonInteractive `
+            -ExecutionPolicy Bypass `
+            -File $signingScript `
+            $installers[0].FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Не вдалося підписати інсталятор: $($installers[0].FullName)"
+          }
           $signedFiles = @($application, $installers[0])
           $expectedCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
             $env:WINDOWS_SIGNING_PUBLIC_CERTIFICATE
