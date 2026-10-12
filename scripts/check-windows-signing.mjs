@@ -23,6 +23,10 @@ if (!args.some((arg) => arg.endsWith("src-tauri/sign-windows.ps1")) || !args.inc
   fail("команда підпису має викликати sign-windows.ps1 і передавати шлях через %1.");
 }
 
+if (/[^\x00-\x7F]/.test(signingScript)) {
+  fail("sign-windows.ps1 має містити лише ASCII, щоб Windows PowerShell 5.1 не пошкоджував UTF-8 без BOM.");
+}
+
 for (const requiredFragment of [
   "/fd SHA256",
   "/tr $timestampUrl",
