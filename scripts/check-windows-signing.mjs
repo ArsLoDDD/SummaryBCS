@@ -41,13 +41,17 @@ for (const requiredFragment of [
   "Export-PfxCertificate",
   "Export-Certificate",
   "SummaryBCS-Code-Signing.cer",
-  "Cert:\\CurrentUser\\Root",
-  "Cert:\\CurrentUser\\TrustedPublisher",
+  "WINDOWS_SIGNING_MODE=$signingMode",
+  "SignerCertificate.Thumbprint -ne $expectedCertificate.Thumbprint",
   "path: windows-artifact/*",
 ]) {
   if (!workflow.includes(requiredFragment)) {
     fail(`Windows workflow втратив резервне самопідписування: ${requiredFragment}.`);
   }
+}
+
+if (workflow.includes("Import-Certificate")) {
+  fail("workflow не повинен імпортувати самопідписаний сертифікат у системне сховище: це може зависнути на прихованому діалозі Windows.");
 }
 
 const configNames = (await readdir(tauriDirectory))

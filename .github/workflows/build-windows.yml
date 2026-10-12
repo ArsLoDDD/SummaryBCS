@@ -141,10 +141,6 @@ jobs:
             throw "Сертифікат ще не чинний або вже прострочений."
           }
           Export-Certificate -Cert $certificate -FilePath $publicCertificatePath -Type CERT | Out-Null
-          if ($signingMode -eq "self-signed") {
-            Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
-            Import-Certificate -FilePath $publicCertificatePath -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
-          }
           "WINDOWS_CERTIFICATE_PATH=$certificatePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "WINDOWS_CERTIFICATE_PASSWORD=$certificatePassword" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "WINDOWS_SIGNING_PUBLIC_CERTIFICATE=$publicCertificatePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -166,11 +162,21 @@ jobs:
           }
           $application = Get-Item "src-tauri/target/release/${{ matrix.binary_name }}.exe"
           $signedFiles = @($application, $installers[0])
+          $expectedCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $env:WINDOWS_SIGNING_PUBLIC_CERTIFICATE
+          )
           $thumbprints = @()
           foreach ($file in $signedFiles) {
             $signature = Get-AuthenticodeSignature -FilePath $file.FullName
-            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            $selfSignedStatusAllowed = $env:WINDOWS_SIGNING_MODE -eq "self-signed" -and ($signature.Status.ToString() -in @("NotTrusted", "UnknownError"))
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -and -not $selfSignedStatusAllowed) {
               throw "Некоректний Authenticode-підпис $($file.Name): $($signature.Status) — $($signature.StatusMessage)"
+            }
+            if ($null -eq $signature.SignerCertificate) {
+              throw "У файлі відсутній сертифікат підписувача: $($file.Name)"
+            }
+            if ($signature.SignerCertificate.Thumbprint -ne $expectedCertificate.Thumbprint) {
+              throw "Файл підписаний не підготовленим сертифікатом: $($file.Name)"
             }
             if ($null -eq $signature.TimeStamperCertificate) {
               throw "Файл не має мітки часу: $($file.Name)"

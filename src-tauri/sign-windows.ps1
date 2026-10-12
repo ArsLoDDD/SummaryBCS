@@ -52,16 +52,36 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 & $signToolPath verify /pa /all /v $targetPath
-if ($LASTEXITCODE -ne 0) {
+$verificationExitCode = $LASTEXITCODE
+$selfSignedMode = $env:WINDOWS_SIGNING_MODE -eq "self-signed"
+if ($verificationExitCode -ne 0 -and -not $selfSignedMode) {
     throw "Підпис створено, але перевірка довіри не пройдена: $targetPath"
 }
 
 $signature = Get-AuthenticodeSignature -FilePath $targetPath
-if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+$selfSignedStatusAllowed = $selfSignedMode -and ($signature.Status.ToString() -in @("NotTrusted", "UnknownError"))
+if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -and -not $selfSignedStatusAllowed) {
     throw "Windows не вважає підпис чинним ($($signature.Status)): $targetPath"
+}
+
+if ($null -eq $signature.SignerCertificate) {
+    throw "У файлі відсутній сертифікат підписувача: $targetPath"
+}
+
+$expectedCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+    $certificatePath,
+    $env:WINDOWS_CERTIFICATE_PASSWORD,
+    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+)
+if ($signature.SignerCertificate.Thumbprint -ne $expectedCertificate.Thumbprint) {
+    throw "Файл підписаний не підготовленим сертифікатом: $targetPath"
 }
 
 if ($null -eq $signature.TimeStamperCertificate) {
     throw "У підписі немає мітки часу: $targetPath"
+}
+
+if ($selfSignedMode -and $verificationExitCode -ne 0) {
+    Write-Warning "Криптографічний підпис і відбиток перевірені; довіра з'явиться після встановлення вкладеного CER."
 }
 
