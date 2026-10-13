@@ -82,6 +82,30 @@ describe("strips report", () => {
     expect(summary.crewTotals).toEqual({ ready: 2, notReady: 0, forming: 0, total: 2 });
   });
 
+  it("combines several units of the same UAV type into one summary row", () => {
+    const report = validReport();
+    const secondUnit = createGroup();
+    secondUnit.unit = "2 РУБАК";
+    secondUnit.uavType = "ФПВ";
+    Object.assign(secondUnit.positions[0], {
+      name: "Позиція 2",
+      readiness: "БГ",
+      bro: "БРО-2",
+      area: "РАЙОН ПІВДЕНЬ",
+      direction: "Південний",
+      crews: [{ ...createCrew(), name: "Соколи", readiness: "БГ", duty: "БЧ" }],
+    });
+    report.strips[0].groups.push(secondUnit);
+
+    const summary = calculateStripsSummary(report.strips);
+    expect(summary.crews).toEqual([
+      { uavType: "ФПВ", ready: 2, notReady: 0, forming: 0, total: 2 },
+    ]);
+    expect(summary.positions).toEqual([
+      { uavType: "ФПВ", ready: 2, notReady: 0, forming: 0, total: 2 },
+    ]);
+  });
+
   it("counts every crew once and reports records without links separately", () => {
     const report = validReport();
     const strip = report.strips[0];

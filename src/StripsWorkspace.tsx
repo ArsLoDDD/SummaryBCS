@@ -335,9 +335,10 @@ interface CrewCellsProps {
   onReadiness: (value: CrewReadiness) => void;
   onDetach?: () => void;
   onRemove: () => void;
+  neutral?: boolean;
 }
 
-function CrewCells({ crew, label, onUpdate, onReadiness, onDetach, onRemove }: CrewCellsProps) {
+function CrewCells({ crew, label, onUpdate, onReadiness, onDetach, onRemove, neutral = false }: CrewCellsProps) {
   const readinessOptions: ReadonlyArray<CustomSelectOption<CrewReadiness>> = CREW_READINESS.map((value) => ({
     value,
     label: value === "Не БГ" ? readinessDisplay(value, crew.notReadyReason) : value,
@@ -345,10 +346,11 @@ function CrewCells({ crew, label, onUpdate, onReadiness, onDetach, onRemove }: C
   const dutyOptions: ReadonlyArray<CustomSelectOption<CrewDuty>> = crew.readiness === "Формується"
     ? [{ value: "Формується", label: "Формується" }]
     : CREW_DUTIES.map((value) => ({ value, label: value }));
+  const tone = neutral ? "status-neutral" : statusClass(crew.readiness);
 
   return (
     <>
-      <td className={`strips-status-band ${statusClass(crew.readiness)}${!crew.name.trim() ? " strips-warning-cell" : ""}`}>
+      <td className={`strips-status-band ${tone}${!crew.name.trim() ? " strips-warning-cell" : ""}`}>
         <div className="strips-input-actions">
           <input
             aria-label={`${label}: назва екіпажу`}
@@ -368,7 +370,7 @@ function CrewCells({ crew, label, onUpdate, onReadiness, onDetach, onRemove }: C
           </div>
         </div>
       </td>
-      <td className={`strips-status-band strips-status-cell ${statusClass(crew.readiness)}${!crew.readiness ? " strips-warning-cell" : ""}`}>
+      <td className={`strips-status-band strips-status-cell ${tone}${!crew.readiness ? " strips-warning-cell" : ""}`}>
         <CustomSelect
           ariaLabel={`${label}: БГ екіпажу`}
           value={crew.readiness}
@@ -376,7 +378,7 @@ function CrewCells({ crew, label, onUpdate, onReadiness, onDetach, onRemove }: C
           onChange={onReadiness}
         />
       </td>
-      <td className={`strips-status-band ${statusClass(crew.readiness)}${!crew.duty ? " strips-warning-cell" : ""}`}>
+      <td className={`strips-status-band ${tone}${!crew.duty ? " strips-warning-cell" : ""}`}>
         <CustomSelect
           ariaLabel={`${label}: БЧ екіпажу`}
           value={crew.duty}
@@ -385,7 +387,7 @@ function CrewCells({ crew, label, onUpdate, onReadiness, onDetach, onRemove }: C
           disabled={crew.readiness === "Формується"}
         />
       </td>
-      <td className={`strips-status-band ${statusClass(crew.readiness)}`}>
+      <td className={`strips-status-band ${tone}`}>
         <input
           aria-label={`${label}: засіб`}
           value={crew.assets}
@@ -581,6 +583,36 @@ export default function StripsWorkspace() {
       ...strip,
       groups: strip.groups.map((group) => group.id === groupId ? update(group) : group),
     }));
+  }
+
+  function updateTypeRun(stripId: string, groupId: string, uavType: UavType) {
+    updateStrip(stripId, (strip) => {
+      const start = strip.groups.findIndex((group) => group.id === groupId);
+      if (start < 0) return strip;
+      const previousType = strip.groups[start].uavType;
+      let end = start + 1;
+      while (previousType && end < strip.groups.length && strip.groups[end].uavType === previousType) end += 1;
+      return {
+        ...strip,
+        groups: strip.groups.map((group, index) => index >= start && index < end
+          ? { ...group, uavType }
+          : group),
+      };
+    });
+  }
+
+  function addUnitToType(stripId: string, groupId: string) {
+    updateStrip(stripId, (strip) => {
+      const start = strip.groups.findIndex((group) => group.id === groupId);
+      if (start < 0 || !strip.groups[start].uavType) return strip;
+      const uavType = strip.groups[start].uavType;
+      let insertAt = start + 1;
+      while (insertAt < strip.groups.length && strip.groups[insertAt].uavType === uavType) insertAt += 1;
+      const group = { ...createGroup(), uavType };
+      const groups = [...strip.groups];
+      groups.splice(insertAt, 0, group);
+      return { ...strip, groups };
+    });
   }
 
   function updatePosition(
@@ -828,7 +860,7 @@ export default function StripsWorkspace() {
                       onChange={(event) => updateStrip(strip.id, (current) => ({ ...current, name: event.target.value }))}
                     />
                     <div>
-                      <button type="button" onClick={() => updateStrip(strip.id, (current) => ({ ...current, groups: [...current.groups, createGroup()] }))}><Plus size={14} /> Підрозділ / тип</button>
+                      <button type="button" onClick={() => updateStrip(strip.id, (current) => ({ ...current, groups: [...current.groups, createGroup()] }))}><Plus size={14} /> Тип БпЛА</button>
                       <button type="button" aria-label="Перемістити смугу вище" disabled={stripIndex === 0} onClick={() => moveStrip(stripIndex, -1)}><ArrowUp size={15} /></button>
                       <button type="button" aria-label="Перемістити смугу нижче" disabled={stripIndex === report.strips.length - 1} onClick={() => moveStrip(stripIndex, 1)}><ArrowDown size={15} /></button>
                       <button type="button" className="danger" aria-label="Видалити смугу" onClick={() => removeStrip(strip.id)}><Trash2 size={15} /></button>
@@ -842,6 +874,15 @@ export default function StripsWorkspace() {
                   <tbody>
                     {strip.groups.flatMap((group, groupIndex) => {
                       const rows = groupTableRows(group);
+                      const previousType = strip.groups[groupIndex - 1]?.uavType;
+                      const isTypeRunStart = !group.uavType || previousType !== group.uavType;
+                      let typeRunRowCount = rows.length;
+                      if (isTypeRunStart && group.uavType) {
+                        for (let index = groupIndex + 1; index < strip.groups.length; index += 1) {
+                          if (strip.groups[index].uavType !== group.uavType) break;
+                          typeRunRowCount += groupTableRows(strip.groups[index]).length;
+                        }
+                      }
                       return rows.map((row, groupRowIndex) => {
                         const groupLabel = `${strip.name}, блок ${groupIndex + 1}`;
                         const groupCells = groupRowIndex === 0 ? (
@@ -876,14 +917,27 @@ export default function StripsWorkspace() {
                                 </div>
                               </div>
                             </td>
-                            <td rowSpan={rows.length} className={`strips-rowspan-select-cell${!group.uavType ? " strips-warning-cell" : ""}`}>
-                              <CustomSelect<UavType>
-                                ariaLabel={`${groupLabel}: тип БпЛА`}
-                                value={group.uavType}
-                                options={uavOptions}
-                                onChange={(value) => updateGroup(strip.id, group.id, (current) => ({ ...current, uavType: value }))}
-                              />
-                            </td>
+                            {isTypeRunStart && (
+                              <td rowSpan={typeRunRowCount} className={`strips-type-rowspan-cell${!group.uavType ? " strips-warning-cell" : ""}`}>
+                                <div className="strips-type-cell">
+                                  <CustomSelect<UavType>
+                                    ariaLabel={`${groupLabel}: тип БпЛА`}
+                                    value={group.uavType}
+                                    options={uavOptions}
+                                    onChange={(value) => updateTypeRun(strip.id, group.id, value)}
+                                  />
+                                  {group.uavType && (
+                                    <div className="strips-type-actions">
+                                      <button
+                                        type="button"
+                                        title={`Додати підрозділ до типу «${group.uavType}»`}
+                                        onClick={() => addUnitToType(strip.id, group.id)}
+                                      ><Plus size={13} /> Підрозділ</button>
+                                    </div>
+                                  )}
+                                </div>
+                              </td>
+                            )}
                           </>
                         ) : null;
 
@@ -898,13 +952,13 @@ export default function StripsWorkspace() {
 
                         if (row.kind === "loose") {
                           const label = `${groupLabel}, екіпаж без позиції ${row.crewIndex + 1}`;
-                          const looseTone = statusClass(row.crew.readiness);
                           return (
                             <tr className="strips-unmatched-row" key={row.crew.id}>
                               {groupCells}
                               <CrewCells
                                 crew={row.crew}
                                 label={label}
+                                neutral
                                 onUpdate={(field, value) => updateCrew(strip.id, group.id, null, row.crew.id, (current) => ({ ...current, [field]: value }))}
                                 onReadiness={(value) => requestCrewReadiness(strip.id, group.id, null, row.crew, value)}
                                 onRemove={() => setPendingConfirmation({
@@ -918,14 +972,10 @@ export default function StripsWorkspace() {
                                   })),
                                 })}
                               />
-                              {row.crew.readiness === "Формується" ? (
-                                ["Позиція", "БГ позиції", "БРО", "Район", "Напрямок"].map((field) => (
-                                  <td key={field} className={`strips-status-band ${looseTone} strips-forming-placeholder`}>Формується</td>
-                                ))
-                              ) : (
-                                <td colSpan={5} className={`strips-status-band ${looseTone} strips-unmatched-label`}>
-                                  <div className="strips-unmatched-actions">
-                                    <span>Екіпаж без позиції</span>
+                              <td colSpan={5} className="strips-status-band status-neutral strips-unmatched-label">
+                                <div className="strips-unmatched-actions">
+                                  <span>Екіпаж без позиції</span>
+                                  {row.crew.readiness !== "Формується" && (
                                     <button
                                       type="button"
                                       title="Створити позицію для цього екіпажу"
@@ -933,9 +983,9 @@ export default function StripsWorkspace() {
                                     >
                                       <MapPinPlus size={14} /> Додати позицію
                                     </button>
-                                  </div>
-                                </td>
-                              )}
+                                  )}
+                                </div>
+                              </td>
                               <td>
                                 <textarea
                                   aria-label={`${label}: примітки`}
@@ -952,8 +1002,8 @@ export default function StripsWorkspace() {
                         const first = row.crewIndex === 0;
                         const position = row.position;
                         const crew = row.crew;
-                        const positionTone = statusClass(position.readiness);
                         const label = `${groupLabel}, позиція ${row.positionIndex + 1}, екіпаж ${row.crewIndex + 1}`;
+                        const positionTone = crew ? statusClass(position.readiness) : "status-neutral";
                         const positionReadinessOptions: ReadonlyArray<CustomSelectOption<PositionReadiness>> = POSITION_READINESS.map((value) => ({
                           value,
                           label: value === "Не БГ" ? readinessDisplay(value, position.notReadyReason) : value,
@@ -980,7 +1030,7 @@ export default function StripsWorkspace() {
                                 })}
                               />
                             ) : (
-                              <td colSpan={4} className={`strips-status-band ${positionTone} strips-unmatched-label`}>
+                              <td colSpan={4} className="strips-status-band status-neutral strips-unmatched-label">
                                 Позиція без екіпажу
                               </td>
                             )}

@@ -25,6 +25,8 @@ const STYLE_DATA_LEFT: usize = 6;
 const STYLE_READY: usize = 7;
 const STYLE_NOT_READY: usize = 8;
 const STYLE_FORMING: usize = 9;
+const STYLE_NEUTRAL: usize = 10;
+const STYLE_NEUTRAL_LEFT: usize = 11;
 const STYLE_SUMMARY_TITLE: usize = 12;
 const STYLE_SUMMARY_SECTION: usize = 13;
 const STYLE_SUMMARY_HEADER: usize = 14;
@@ -687,8 +689,30 @@ fn build_sheet(report: &PreparedReport, summary: &StripsSummary) -> String {
         write_data_header(&mut rows, row);
         row += 1;
 
-        for group in &strip.groups {
-            write_group(&mut rows, &mut merges, &mut row, group);
+        let mut group_index = 0usize;
+        while group_index < strip.groups.len() {
+            let run_start = group_index;
+            let uav_type = &strip.groups[run_start].uav_type;
+            group_index += 1;
+            while group_index < strip.groups.len()
+                && strip.groups[group_index].uav_type == *uav_type
+            {
+                group_index += 1;
+            }
+            let type_start_row = row;
+            let type_rows = strip.groups[run_start..group_index]
+                .iter()
+                .map(group_row_count)
+                .sum::<usize>();
+            if type_rows > 1 {
+                merges.push(format!(
+                    "B{type_start_row}:B{}",
+                    type_start_row + type_rows - 1
+                ));
+            }
+            for (offset, group) in strip.groups[run_start..group_index].iter().enumerate() {
+                write_group(&mut rows, &mut merges, &mut row, group, offset == 0);
+            }
         }
 
         let strip_summary = calculate_summary(std::slice::from_ref(strip));
@@ -779,31 +803,49 @@ fn write_group(
     merges: &mut Vec<String>,
     row: &mut usize,
     group: &PreparedGroup,
+    write_uav_type: bool,
 ) {
     let group_start = *row;
-    let group_rows = group
-        .positions
-        .iter()
-        .map(|position| position.crews.len().max(1))
-        .sum::<usize>()
-        + group.loose_crews.len();
+    let group_rows = group_row_count(group);
     let group_end = group_start + group_rows - 1;
     if group_rows > 1 {
         merges.push(format!("A{group_start}:A{group_end}"));
-        merges.push(format!("B{group_start}:B{group_end}"));
     }
 
     let mut first_group_row = true;
     for position in &group.positions {
-        let header = first_group_row.then_some((group.unit.as_str(), group.uav_type.as_str()));
+        let header = first_group_row.then_some((
+            group.unit.as_str(),
+            if write_uav_type {
+                group.uav_type.as_str()
+            } else {
+                ""
+            },
+        ));
         write_position(rows, merges, row, position, header);
         first_group_row = false;
     }
     for crew in &group.loose_crews {
-        let header = first_group_row.then_some((group.unit.as_str(), group.uav_type.as_str()));
-        write_loose_crew(rows, row, crew, header);
+        let header = first_group_row.then_some((
+            group.unit.as_str(),
+            if write_uav_type {
+                group.uav_type.as_str()
+            } else {
+                ""
+            },
+        ));
+        write_loose_crew(rows, merges, row, crew, header);
         first_group_row = false;
     }
+}
+
+fn group_row_count(group: &PreparedGroup) -> usize {
+    group
+        .positions
+        .iter()
+        .map(|position| position.crews.len().max(1))
+        .sum::<usize>()
+        + group.loose_crews.len()
 }
 
 fn write_position(
@@ -828,8 +870,17 @@ fn write_position(
 
     for offset in 0..row_count {
         let current_row = start_row + offset;
-        let position_center = readiness_style(&position.readiness);
-        let position_left = readiness_left_style(&position.readiness);
+        let unmatched = position.crews.is_empty();
+        let position_center = if unmatched {
+            STYLE_NEUTRAL
+        } else {
+            readiness_style(&position.readiness)
+        };
+        let position_left = if unmatched {
+            STYLE_NEUTRAL_LEFT
+        } else {
+            readiness_left_style(&position.readiness)
+        };
         let first = offset == 0;
         let (unit, uav_type) = if first {
             group_header.unwrap_or(("", ""))
@@ -933,6 +984,7 @@ fn write_position(
 
 fn write_loose_crew(
     rows: &mut String,
+    merges: &mut Vec<String>,
     row: &mut usize,
     value: &PreparedLooseCrew,
     group_header: Option<(&str, &str)>,
@@ -941,37 +993,18 @@ fn write_loose_crew(
     let crew = &value.crew;
     let (unit, uav_type) = group_header.unwrap_or(("", ""));
     let crew_readiness = readiness_display(&crew.readiness, &crew.not_ready_reason);
-    let center_style = readiness_style(&crew.readiness);
-    let left_style = readiness_left_style(&crew.readiness);
     let loose_note = crew.note.clone();
-    let mut cells = vec![
+    merges.push(format!("G{current_row}:K{current_row}"));
+    let cells = vec![
         text_cell(0, current_row, unit, STYLE_DATA_CENTER),
         text_cell(1, current_row, uav_type, STYLE_DATA_CENTER),
-        text_cell(2, current_row, &crew.name, center_style),
-        text_cell(3, current_row, &crew_readiness, center_style),
-        text_cell(4, current_row, &crew.duty, center_style),
-        text_cell(5, current_row, &crew.assets, left_style),
+        text_cell(2, current_row, &crew.name, STYLE_NEUTRAL),
+        text_cell(3, current_row, &crew_readiness, STYLE_NEUTRAL),
+        text_cell(4, current_row, &crew.duty, STYLE_NEUTRAL),
+        text_cell(5, current_row, &crew.assets, STYLE_NEUTRAL_LEFT),
+        text_cell(6, current_row, "Екіпаж без позиції", STYLE_NEUTRAL),
+        text_cell(11, current_row, &loose_note, STYLE_DATA_LEFT),
     ];
-    for column in 6..=10 {
-        let value = if crew.readiness == "Формується" {
-            "Формується"
-        } else if column == 6 {
-            "Екіпаж без позиції"
-        } else {
-            ""
-        };
-        cells.push(text_cell(
-            column,
-            current_row,
-            value,
-            if column == 10 {
-                left_style
-            } else {
-                center_style
-            },
-        ));
-    }
-    cells.push(text_cell(11, current_row, &loose_note, STYLE_DATA_LEFT));
     let height_values = [
         (unit, 18),
         (uav_type, 18),
@@ -1626,7 +1659,10 @@ mod tests {
         assert!(sheet.contains("ПІВНІЧ"));
         assert!(sheet.contains("Позиція без екіпажу"));
         assert!(sheet.contains("Екіпаж без позиції"));
-        assert!(sheet.matches("Формується").count() >= 7);
+        assert!(sheet.matches("Формується").count() >= 2);
+        assert!(sheet.contains("<mergeCell ref=\"G9:K9\"/>"));
+        assert!(sheet.contains("<c r=\"C8\" s=\"10\""));
+        assert!(sheet.contains("<c r=\"C9\" s=\"10\""));
         assert!(sheet.contains("Показник"));
         assert!(sheet.contains("<t xml:space=\"preserve\">Екіпажі</t>"));
         assert!(sheet.contains("<t xml:space=\"preserve\">Позиції</t>"));
@@ -1691,5 +1727,17 @@ mod tests {
         assert!(sheet.contains("<mergeCell ref=\"B6:B9\"/>"));
         assert!(sheet.contains("<mergeCell ref=\"G6:G7\"/>"));
         assert!(!sheet.contains("<mergeCell ref=\"G6:G9\"/>"));
+    }
+
+    #[test]
+    fn merges_one_uav_type_across_consecutive_units() {
+        let mut value = request("report.xlsx".into());
+        value.strips[0].groups[1].uav_type = "ФПВ".into();
+        let prepared = prepare_request(value).unwrap();
+        let sheet = build_sheet(&prepared, &calculate_summary(&prepared.strips));
+
+        assert!(sheet.contains("<mergeCell ref=\"A6:A7\"/>"));
+        assert!(sheet.contains("<mergeCell ref=\"B6:B8\"/>"));
+        assert!(!sheet.contains("<mergeCell ref=\"A6:A8\"/>"));
     }
 }

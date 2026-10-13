@@ -1745,6 +1745,7 @@ button:disabled {
 .strips-editor-table td.strips-status-band.status-ready { background: #d7e48d; }
 .strips-editor-table td.strips-status-band.status-not-ready { background: #e6b8b7; }
 .strips-editor-table td.strips-status-band.status-forming { background: #fdeada; }
+.strips-editor-table td.strips-status-band.status-neutral { background: #f2f2f2; }
 .strips-warning-cell { box-shadow: inset 0 0 0 2px #c65911; }
 
 .strips-strip-summary {
@@ -1772,7 +1773,8 @@ button:disabled {
 
 .strips-input-actions,
 .strips-position-cell,
-.strips-group-cell {
+.strips-group-cell,
+.strips-type-cell {
   position: relative;
   min-height: 75px;
   height: 100%;
@@ -1782,6 +1784,7 @@ button:disabled {
 }
 
 .strips-group-rowspan-cell > .strips-group-cell,
+.strips-type-rowspan-cell > .strips-type-cell,
 .strips-position-cell {
   position: absolute;
   inset: 0;
@@ -1796,6 +1799,7 @@ button:disabled {
 }
 
 .strips-group-actions,
+.strips-type-actions,
 .strips-position-actions,
 .strips-crew-actions {
   display: flex;
@@ -1806,6 +1810,7 @@ button:disabled {
 }
 
 .strips-group-actions button,
+.strips-type-actions button,
 .strips-position-actions button,
 .strips-crew-actions button,
 .strips-unmatched-actions button {
@@ -1826,6 +1831,8 @@ button:disabled {
 
 .strips-position-actions button,
 .strips-crew-actions button { font-size: 9px; }
+.strips-type-cell > .custom-select { min-height: 0; }
+.strips-type-actions button { margin: 0 auto; }
 .strips-crew-actions button { width: 27px; padding: 2px; }
 .strips-position-actions button:not(.danger),
 .strips-crew-actions button:not(.danger) { color: #1d4ed8; }
