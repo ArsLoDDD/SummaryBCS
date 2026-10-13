@@ -69,6 +69,11 @@ jobs:
             bundle_command: npm run tauri -- bundle --config src-tauri/tauri.strips.conf.json --bundles nsis --no-sign --no-binary-patching
             artifact_name: BCS-Windows-Strips
             binary_name: StripsEditor
+          - app: Strips Registry
+            compile_command: npm run tauri -- build --config src-tauri/tauri.strips-registry.conf.json --no-bundle --no-sign
+            bundle_command: npm run tauri -- bundle --config src-tauri/tauri.strips-registry.conf.json --bundles nsis --no-sign --no-binary-patching
+            artifact_name: BCS-Windows-Strips-Registry
+            binary_name: StripsRegistry
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
