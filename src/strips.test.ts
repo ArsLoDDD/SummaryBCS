@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  CREW_WITHOUT_POSITION_NOTE,
+  POSITION_WITHOUT_CREW_NOTE,
   applyCrewReadiness,
   applyPositionReadiness,
   attachLooseCrew,
@@ -171,14 +173,82 @@ describe("strips report", () => {
     const group = report.strips[0].groups[0];
     const position = group.positions[0];
     const crew = position.crews[0];
+    position.note = "Примітка позиції";
+    crew.note = "Примітка екіпажу";
     const detached = detachCrew(group, position.id, crew.id);
     expect(detached.positions[0].crews).toHaveLength(0);
     expect(detached.looseCrews.map((item) => item.id)).toEqual([crew.id]);
+    expect(detached.positions[0].note).toBe(`${POSITION_WITHOUT_CREW_NOTE}\nПримітка позиції`);
+    expect(detached.looseCrews[0].note).toBe(`${CREW_WITHOUT_POSITION_NOTE}\nПримітка екіпажу`);
 
     const attached = attachLooseCrew(detached, position.id, crew.id);
     expect(attached.positions[0].crews.map((item) => item.id)).toEqual([crew.id]);
     expect(attached.looseCrews).toHaveLength(0);
+    expect(attached.positions[0].note).toBe("Примітка позиції");
+    expect(attached.positions[0].crews[0].note).toBe("Примітка екіпажу");
     expect(attachLooseCrew(attached, position.id, crew.id)).toBe(attached);
+  });
+
+  it("adds the required notes to ready unlinked records", () => {
+    const report = validReport();
+    const group = report.strips[0].groups[0];
+    const position = group.positions[0];
+    position.crews = [];
+    const updated = applyPositionReadiness(position, "БГ");
+    expect(updated.note).toBe(POSITION_WITHOUT_CREW_NOTE);
+
+    const loose = { ...createCrew(), name: "Варта", duty: "БЧ" as const };
+    group.looseCrews = [loose];
+    const readyGroup = setCrewReadinessInGroup(group, null, loose.id, "БГ");
+    expect(readyGroup.looseCrews[0].note).toBe(CREW_WITHOUT_POSITION_NOTE);
+  });
+
+  it("allows one consecutive type block with unique units and rejects repeated type blocks or units", () => {
+    const report = validReport();
+    const makeLooseGroup = (unit: string, uavType: "ФПВ" | "Бомбер", crewName: string) => {
+      const group = createGroup();
+      group.unit = unit;
+      group.uavType = uavType;
+      group.positions = [];
+      group.looseCrews = [{
+        ...createCrew(),
+        name: crewName,
+        readiness: "БГ",
+        duty: "БЧ",
+      }];
+      return group;
+    };
+
+    report.strips[0].groups.push(makeLooseGroup("2 РУБАК", "ФПВ", "Сокіл"));
+    expect(validateStripsReport(report)).toBe("");
+
+    report.strips[0].groups.push(makeLooseGroup("3 РУБАК", "Бомбер", "Грім"));
+    report.strips[0].groups.push(makeLooseGroup("4 РУБАК", "ФПВ", "Варта"));
+    expect(validateStripsReport(report)).toContain("тип БпЛА «ФПВ» уже доданий");
+
+    const duplicateUnitReport = validReport();
+    duplicateUnitReport.strips[0].groups.push(makeLooseGroup(" 1   рубак ", "ФПВ", "Буря"));
+    expect(validateStripsReport(duplicateUnitReport)).toContain("підрозділ «1   рубак» уже доданий");
+  });
+
+  it("rejects a repeated crew name globally and never counts it twice", () => {
+    const report = validReport();
+    const secondStrip = createStrip("Смуга БРАВО");
+    const secondGroup = secondStrip.groups[0];
+    secondGroup.unit = "2 РУБАК";
+    secondGroup.uavType = "Бомбер";
+    Object.assign(secondGroup.positions[0], {
+      name: "Позиція 2",
+      readiness: "БГ",
+      bro: "БРО-2",
+      area: "РАЙОН ПІВДЕНЬ",
+      direction: "Південний",
+      crews: [{ ...createCrew(), name: "  ВОВКИ ", readiness: "БГ", duty: "БЧ" }],
+    });
+    report.strips.push(secondStrip);
+
+    expect(validateStripsReport(report)).toContain("Екіпаж може бути лише в одному місці");
+    expect(calculateStripsSummary(report.strips).crewTotals.total).toBe(1);
   });
 
   it("creates a position for an existing crew and blocks that action for forming crews", () => {
@@ -282,5 +352,7 @@ describe("strips report", () => {
     expect(summary.positionTotals).toEqual({ ready: 2, notReady: 1, forming: 0, total: 3 });
     expect(summary.crewsWithoutPosition).toBe(2);
     expect(summary.positionsWithoutCrews).toBe(1);
+    expect(report.strips[1].groups[1].positions[0].note).toContain(POSITION_WITHOUT_CREW_NOTE);
+    expect(report.strips[2].groups[0].looseCrews[0].note).toContain(CREW_WITHOUT_POSITION_NOTE);
   });
 });

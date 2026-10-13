@@ -3,6 +3,8 @@ import { UAV_TYPES } from "./structure";
 export const POSITION_READINESS = ["БГ", "Не БГ"] as const;
 export const CREW_READINESS = ["БГ", "Не БГ", "Формується"] as const;
 export const CREW_DUTIES = ["БЧ", "Відпочинок після БЧ"] as const;
+export const POSITION_WITHOUT_CREW_NOTE = "Позиція готова до роботи, відсутній екіпаж";
+export const CREW_WITHOUT_POSITION_NOTE = "Екіпаж готовий до виконання задач, відсутня позиція";
 
 export type PositionReadiness = typeof POSITION_READINESS[number];
 export type CrewReadiness = typeof CREW_READINESS[number];
@@ -154,7 +156,7 @@ export function createDemoStripsReport(reportDate: string): StripsReport {
     crews: StripCrew[],
     notReadyReason = "",
     note = "",
-  ): StripPosition => ({
+  ): StripPosition => syncPositionSystemNote({
     ...createPosition(),
     name,
     readiness,
@@ -170,7 +172,13 @@ export function createDemoStripsReport(reportDate: string): StripsReport {
     uavType: UavType,
     positions: StripPosition[],
     looseCrews: StripCrew[] = [],
-  ): StripGroup => ({ ...createGroup(), unit, uavType, positions, looseCrews });
+  ): StripGroup => ({
+    ...createGroup(),
+    unit,
+    uavType,
+    positions,
+    looseCrews: looseCrews.map((value) => syncCrewSystemNote(value, true)),
+  });
   const strip = (name: string, groups: StripGroup[]): WorkStrip => ({ ...createStrip(name), groups });
 
   return {
@@ -273,6 +281,37 @@ export function readinessDisplay(status: string, reason: string): string {
   return normalizedReason ? `Не БГ (${normalizedReason})` : "Не БГ";
 }
 
+function toggleSystemNote(note: string, systemNote: string, required: boolean): string {
+  const userNote = note
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== systemNote)
+    .join("\n")
+    .trim();
+  return required ? [systemNote, userNote].filter(Boolean).join("\n") : userNote;
+}
+
+export function syncPositionSystemNote(position: StripPosition): StripPosition {
+  return {
+    ...position,
+    note: toggleSystemNote(
+      position.note,
+      POSITION_WITHOUT_CREW_NOTE,
+      position.readiness === "БГ" && position.crews.length === 0,
+    ),
+  };
+}
+
+export function syncCrewSystemNote(crew: StripCrew, withoutPosition: boolean): StripCrew {
+  return {
+    ...crew,
+    note: toggleSystemNote(
+      crew.note,
+      CREW_WITHOUT_POSITION_NOTE,
+      withoutPosition && crew.readiness === "БГ",
+    ),
+  };
+}
+
 export function applyCrewReadiness(crew: StripCrew, readiness: CrewReadiness, reason = ""): StripCrew {
   if (readiness === "Не БГ" && !reason.trim()) return crew;
   if (readiness === "Формується") {
@@ -292,11 +331,11 @@ export function applyPositionReadiness(
   reason = "",
 ): StripPosition {
   if (readiness === "Не БГ" && !reason.trim()) return position;
-  return {
+  return syncPositionSystemNote({
     ...position,
     readiness,
     notReadyReason: readiness === "Не БГ" ? reason.trim() : "",
-  };
+  });
 }
 
 export function createCrewForPosition(position: StripPosition): StripCrew {
@@ -316,9 +355,12 @@ export function detachCrew(
   return {
     ...group,
     positions: group.positions.map((item) => item.id === positionId
-      ? { ...item, crews: item.crews.filter((candidate) => candidate.id !== crewId) }
+      ? syncPositionSystemNote({
+          ...item,
+          crews: item.crews.filter((candidate) => candidate.id !== crewId),
+        })
       : item),
-    looseCrews: [...group.looseCrews, crew],
+    looseCrews: [...group.looseCrews, syncCrewSystemNote(crew, true)],
   };
 }
 
@@ -345,7 +387,7 @@ export function attachLooseCrew(
   if (!position || !crew || attachmentProblem(position, crew)) return group;
 
   let nextPosition = position;
-  let nextCrew = crew;
+  let nextCrew = syncCrewSystemNote(crew, false);
   if (!nextPosition.readiness && nextCrew.readiness) {
     nextPosition = applyPositionReadiness(
       nextPosition,
@@ -363,7 +405,7 @@ export function attachLooseCrew(
   return {
     ...group,
     positions: group.positions.map((item) => item.id === positionId
-      ? { ...nextPosition, crews: [...nextPosition.crews, nextCrew] }
+      ? syncPositionSystemNote({ ...nextPosition, crews: [...nextPosition.crews, nextCrew] })
       : item),
     looseCrews: group.looseCrews.filter((item) => item.id !== crewId),
   };
@@ -372,7 +414,8 @@ export function attachLooseCrew(
 export function createPositionForLooseCrew(group: StripGroup, crewId: string): StripGroup {
   const crew = group.looseCrews.find((item) => item.id === crewId);
   if (!crew || crew.readiness === "Формується") return group;
-  let position = createPosition([crew]);
+  const linkedCrew = syncCrewSystemNote(crew, false);
+  let position = createPosition([linkedCrew]);
   if (crew.readiness) {
     position = applyPositionReadiness(
       position,
@@ -399,7 +442,7 @@ export function setCrewReadinessInGroup(
     return {
       ...group,
       looseCrews: group.looseCrews.map((crew) => crew.id === crewId
-        ? applyCrewReadiness(crew, readiness, reason)
+        ? syncCrewSystemNote(applyCrewReadiness(crew, readiness, reason), true)
         : crew),
     };
   }
@@ -418,7 +461,9 @@ export function setCrewReadinessInGroup(
       positions: group.positions.map((item) => item.id === positionId
         ? {
             ...updatedPosition,
-            crews: item.crews.map((candidate) => candidate.id === crewId ? updatedCrew : candidate),
+            crews: item.crews.map((candidate) => candidate.id === crewId
+              ? syncCrewSystemNote(updatedCrew, false)
+              : candidate),
           }
         : item),
     };
@@ -429,11 +474,14 @@ export function setCrewReadinessInGroup(
     return {
       ...group,
       positions: group.positions.map((item) => item.id === positionId
-        ? { ...item, crews: item.crews.filter((candidate) => candidate.id !== crewId) }
+        ? syncPositionSystemNote({
+            ...item,
+            crews: item.crews.filter((candidate) => candidate.id !== crewId),
+          })
         : item),
       looseCrews: group.looseCrews.some((item) => item.id === crewId)
         ? group.looseCrews
-        : [...group.looseCrews, updatedCrew],
+        : [...group.looseCrews, syncCrewSystemNote(updatedCrew, true)],
     };
   }
   return {
@@ -441,7 +489,9 @@ export function setCrewReadinessInGroup(
     positions: group.positions.map((item) => item.id === positionId
       ? {
           ...item,
-          crews: item.crews.map((candidate) => candidate.id === crewId ? updatedCrew : candidate),
+          crews: item.crews.map((candidate) => candidate.id === crewId
+            ? syncCrewSystemNote(updatedCrew, false)
+            : candidate),
         }
       : item),
   };
@@ -461,14 +511,14 @@ export function setPositionReadinessInGroup(
   const detached: StripCrew[] = [];
   updatedPosition.crews.forEach((crew) => {
     if (!crew.readiness) {
-      compatible.push(applyCrewReadiness(crew, readiness, reason));
-    } else if (crew.readiness === readiness) compatible.push(crew);
-    else detached.push(crew);
+      compatible.push(syncCrewSystemNote(applyCrewReadiness(crew, readiness, reason), false));
+    } else if (crew.readiness === readiness) compatible.push(syncCrewSystemNote(crew, false));
+    else detached.push(syncCrewSystemNote(crew, true));
   });
   return {
     ...group,
     positions: group.positions.map((item) => item.id === positionId
-      ? { ...updatedPosition, crews: compatible }
+      ? syncPositionSystemNote({ ...updatedPosition, crews: compatible })
       : item),
     looseCrews: [
       ...group.looseCrews,
@@ -479,6 +529,10 @@ export function setPositionReadinessInGroup(
 
 function missing(value: string): boolean {
   return value.trim().length === 0;
+}
+
+function normalizedLabel(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLocaleLowerCase("uk-UA");
 }
 
 function validIsoDate(value: string): boolean {
@@ -515,6 +569,7 @@ export function validateStripsReportErrors(report: StripsReport): string[] {
   if (!validIsoDate(report.reportDate)) problems.push("Оберіть правильну дату звіту.");
   if (report.strips.length === 0) problems.push("Додайте хоча б одну смугу.");
   const ids = new Set<string>();
+  const crewNames = new Map<string, string>();
   const checkUniqueId = (value: string, label: string) => {
     if (missing(value)) {
       problems.push(`${label}: службовий ідентифікатор відсутній.`);
@@ -526,6 +581,16 @@ export function validateStripsReportErrors(report: StripsReport): string[] {
     }
     ids.add(value);
   };
+  const checkUniqueCrewName = (crew: StripCrew, label: string) => {
+    const key = normalizedLabel(crew.name);
+    if (!key) return;
+    const previous = crewNames.get(key);
+    if (previous) {
+      problems.push(`${label}: назва екіпажу «${crew.name.trim()}» уже використана в «${previous}». Екіпаж може бути лише в одному місці.`);
+      return;
+    }
+    crewNames.set(key, label);
+  };
 
   for (const [stripIndex, strip] of report.strips.entries()) {
     const stripLabel = `Смуга ${stripIndex + 1}`;
@@ -536,11 +601,33 @@ export function validateStripsReportErrors(report: StripsReport): string[] {
       problems.push(`${stripName}: додайте хоча б один блок підрозділу та типу БпЛА.`);
     }
 
+    const typeRuns = new Set<string>();
+    const unitsByType = new Set<string>();
+    let previousType = "";
+
     for (const [groupIndex, group] of strip.groups.entries()) {
       const groupLabel = `${stripName}, блок ${groupIndex + 1}`;
       checkUniqueId(group.id, groupLabel);
       if (missing(group.unit)) problems.push(`${groupLabel}: вкажіть підрозділ.`);
       if (!group.uavType) problems.push(`${groupLabel}: оберіть тип БпЛА.`);
+      const typeKey = normalizedLabel(group.uavType);
+      if (typeKey && typeKey !== previousType) {
+        if (typeRuns.has(typeKey)) {
+          problems.push(`${groupLabel}: тип БпЛА «${group.uavType}» уже доданий у цій смузі. Додавайте підрозділи кнопкою «Підрозділ» у спільному блоці типу.`);
+        } else {
+          typeRuns.add(typeKey);
+        }
+      }
+      previousType = typeKey;
+      const unitKey = normalizedLabel(group.unit);
+      if (typeKey && unitKey) {
+        const key = `${typeKey}\u0000${unitKey}`;
+        if (unitsByType.has(key)) {
+          problems.push(`${groupLabel}: підрозділ «${group.unit.trim()}» уже доданий до типу «${group.uavType}».`);
+        } else {
+          unitsByType.add(key);
+        }
+      }
       if (group.positions.length === 0 && group.looseCrews.length === 0) {
         problems.push(`${groupLabel}: додайте позицію або екіпаж без позиції.`);
       }
@@ -560,6 +647,7 @@ export function validateStripsReportErrors(report: StripsReport): string[] {
           const crewLabel = `${label}, екіпаж ${crewIndex + 1}`;
           checkUniqueId(crew.id, crewLabel);
           problems.push(...crewProblems(crew, crewLabel));
+          checkUniqueCrewName(crew, crewLabel);
           if (crew.readiness === "Формується") {
             problems.push(`${crewLabel}: екіпаж, що формується, не може бути закріплений за позицією.`);
           }
@@ -573,6 +661,7 @@ export function validateStripsReportErrors(report: StripsReport): string[] {
         const label = `${groupLabel}, екіпаж без позиції ${crewIndex + 1}`;
         checkUniqueId(crew.id, label);
         problems.push(...crewProblems(crew, label));
+        checkUniqueCrewName(crew, label);
       }
     }
   }
@@ -629,14 +718,18 @@ export function calculateStripsSummary(strips: WorkStrip[]): StripsSummary {
         }
         addStatus(countsFor(positionByType, group.uavType as UavType), position.readiness);
         position.crews.forEach((crew) => {
-          if (seenCrews.has(crew.id)) return;
-          seenCrews.add(crew.id);
+          const nameKey = normalizedLabel(crew.name);
+          const crewKey = nameKey ? `name:${nameKey}` : `id:${crew.id}`;
+          if (seenCrews.has(crewKey)) return;
+          seenCrews.add(crewKey);
           addStatus(countsFor(crewByType, group.uavType as UavType), crew.readiness);
         });
       });
       group.looseCrews.forEach((crew) => {
-        if (seenCrews.has(crew.id)) return;
-        seenCrews.add(crew.id);
+        const nameKey = normalizedLabel(crew.name);
+        const crewKey = nameKey ? `name:${nameKey}` : `id:${crew.id}`;
+        if (seenCrews.has(crewKey)) return;
+        seenCrews.add(crewKey);
         addStatus(countsFor(crewByType, group.uavType as UavType), crew.readiness);
         crewsWithoutPosition += 1;
         looseCrewsByType.set(
@@ -743,23 +836,26 @@ function normalizeGroupLinks(
     const linked: StripCrew[] = [];
     position.crews.forEach((crew) => {
       if (crew.readiness === "Формується") {
-        detach(crew);
+        detach(syncCrewSystemNote(crew, true));
         return;
       }
       if (!targetStatus) {
-        linked.push(crew);
+        linked.push(syncCrewSystemNote(crew, false));
         return;
       }
       if (!crew.readiness) {
-        linked.push(applyCrewReadiness(crew, targetStatus, targetReason));
+        linked.push(syncCrewSystemNote(applyCrewReadiness(crew, targetStatus, targetReason), false));
         return;
       }
-      if (crew.readiness === targetStatus) linked.push(crew);
-      else detach(crew);
+      if (crew.readiness === targetStatus) linked.push(syncCrewSystemNote(crew, false));
+      else detach(syncCrewSystemNote(crew, true));
     });
-    return { ...migratedPosition, crews: linked };
+    return syncPositionSystemNote({ ...migratedPosition, crews: linked });
   });
-  return { positions: migratedPositions, looseCrews: detached };
+  return {
+    positions: migratedPositions,
+    looseCrews: detached.map((crew) => syncCrewSystemNote(crew, true)),
+  };
 }
 
 function normalizePosition(

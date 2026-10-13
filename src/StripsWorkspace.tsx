@@ -34,6 +34,8 @@ import {
   readinessDisplay,
   setCrewReadinessInGroup,
   setPositionReadinessInGroup,
+  syncCrewSystemNote,
+  syncPositionSystemNote,
   upperUk,
   validateStripsReportErrors,
   type CrewDuty,
@@ -69,6 +71,29 @@ function messageFrom(error: unknown): string {
 
 function cleanAssets(value: string): string {
   return value.split(",").map((item) => item.trim()).filter(Boolean).join(", ");
+}
+
+function normalizedUiLabel(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLocaleLowerCase("uk-UA");
+}
+
+function availableUavOptions(strip: WorkStrip, groupIndex: number): ReadonlyArray<CustomSelectOption<UavType>> {
+  const currentType = strip.groups[groupIndex]?.uavType ?? "";
+  let runStart = groupIndex;
+  let runEnd = groupIndex + 1;
+  if (currentType) {
+    while (runStart > 0 && strip.groups[runStart - 1].uavType === currentType) runStart -= 1;
+    while (runEnd < strip.groups.length && strip.groups[runEnd].uavType === currentType) runEnd += 1;
+  }
+  const usedOutsideRun = new Set(
+    strip.groups
+      .filter((_, index) => index < runStart || index >= runEnd)
+      .map((group) => group.uavType)
+      .filter(Boolean),
+  );
+  return UAV_TYPES
+    .filter((value) => value === currentType || !usedOutsideRun.has(value))
+    .map((value) => ({ value, label: value }));
 }
 
 function validationCountLabel(count: number): string {
@@ -336,9 +361,19 @@ interface CrewCellsProps {
   onDetach?: () => void;
   onRemove: () => void;
   neutral?: boolean;
+  invalidName?: boolean;
 }
 
-function CrewCells({ crew, label, onUpdate, onReadiness, onDetach, onRemove, neutral = false }: CrewCellsProps) {
+function CrewCells({
+  crew,
+  label,
+  onUpdate,
+  onReadiness,
+  onDetach,
+  onRemove,
+  neutral = false,
+  invalidName = false,
+}: CrewCellsProps) {
   const readinessOptions: ReadonlyArray<CustomSelectOption<CrewReadiness>> = CREW_READINESS.map((value) => ({
     value,
     label: value === "Не БГ" ? readinessDisplay(value, crew.notReadyReason) : value,
@@ -350,7 +385,7 @@ function CrewCells({ crew, label, onUpdate, onReadiness, onDetach, onRemove, neu
 
   return (
     <>
-      <td className={`strips-status-band ${tone}${!crew.name.trim() ? " strips-warning-cell" : ""}`}>
+      <td className={`strips-status-band ${tone}${!crew.name.trim() || invalidName ? " strips-warning-cell" : ""}`}>
         <div className="strips-input-actions">
           <input
             aria-label={`${label}: назва екіпажу`}
@@ -514,7 +549,20 @@ export default function StripsWorkspace() {
   const tauriAvailable = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   const validationErrors = useMemo(() => validateStripsReportErrors(report), [report]);
   const summary = useMemo(() => calculateStripsSummary(report.strips), [report.strips]);
-  const uavOptions = UAV_TYPES.map((value) => ({ value, label: value }));
+  const duplicateCrewNames = useMemo(() => {
+    const counts = new Map<string, number>();
+    report.strips.forEach((strip) => strip.groups.forEach((group) => {
+      const crews = [
+        ...group.positions.flatMap((position) => position.crews),
+        ...group.looseCrews,
+      ];
+      crews.forEach((crew) => {
+        const key = normalizedUiLabel(crew.name);
+        if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+      });
+    }));
+    return new Set([...counts].filter(([, count]) => count > 1).map(([name]) => name));
+  }, [report.strips]);
   const pendingLinkContext = useMemo(() => {
     if (!pendingLink) return null;
     const strip = report.strips.find((item) => item.id === pendingLink.stripId);
@@ -592,6 +640,9 @@ export default function StripsWorkspace() {
       const previousType = strip.groups[start].uavType;
       let end = start + 1;
       while (previousType && end < strip.groups.length && strip.groups[end].uavType === previousType) end += 1;
+      if (strip.groups.some((group, index) => (
+        (index < start || index >= end) && group.uavType === uavType
+      ))) return strip;
       return {
         ...strip,
         groups: strip.groups.map((group, index) => index >= start && index < end
@@ -623,7 +674,9 @@ export default function StripsWorkspace() {
   ) {
     updateGroup(stripId, groupId, (group) => ({
       ...group,
-      positions: group.positions.map((position) => position.id === positionId ? update(position) : position),
+      positions: group.positions.map((position) => position.id === positionId
+        ? syncPositionSystemNote(update(position))
+        : position),
     }));
   }
 
@@ -638,12 +691,19 @@ export default function StripsWorkspace() {
       ? {
           ...group,
           positions: group.positions.map((position) => position.id === positionId
-            ? { ...position, crews: position.crews.map((crew) => crew.id === crewId ? update(crew) : crew) }
+            ? {
+                ...position,
+                crews: position.crews.map((crew) => crew.id === crewId
+                  ? syncCrewSystemNote(update(crew), false)
+                  : crew),
+              }
             : position),
         }
       : {
           ...group,
-          looseCrews: group.looseCrews.map((crew) => crew.id === crewId ? update(crew) : crew),
+          looseCrews: group.looseCrews.map((crew) => crew.id === crewId
+            ? syncCrewSystemNote(update(crew), true)
+            : crew),
         });
   }
 
@@ -860,7 +920,12 @@ export default function StripsWorkspace() {
                       onChange={(event) => updateStrip(strip.id, (current) => ({ ...current, name: event.target.value }))}
                     />
                     <div>
-                      <button type="button" onClick={() => updateStrip(strip.id, (current) => ({ ...current, groups: [...current.groups, createGroup()] }))}><Plus size={14} /> Тип БпЛА</button>
+                      <button
+                        type="button"
+                        disabled={new Set(strip.groups.map((group) => group.uavType).filter(Boolean)).size >= UAV_TYPES.length}
+                        title="Додати новий тип БпЛА до смуги"
+                        onClick={() => updateStrip(strip.id, (current) => ({ ...current, groups: [...current.groups, createGroup()] }))}
+                      ><Plus size={14} /> Тип БпЛА</button>
                       <button type="button" aria-label="Перемістити смугу вище" disabled={stripIndex === 0} onClick={() => moveStrip(stripIndex, -1)}><ArrowUp size={15} /></button>
                       <button type="button" aria-label="Перемістити смугу нижче" disabled={stripIndex === report.strips.length - 1} onClick={() => moveStrip(stripIndex, 1)}><ArrowDown size={15} /></button>
                       <button type="button" className="danger" aria-label="Видалити смугу" onClick={() => removeStrip(strip.id)}><Trash2 size={15} /></button>
@@ -885,9 +950,14 @@ export default function StripsWorkspace() {
                       }
                       return rows.map((row, groupRowIndex) => {
                         const groupLabel = `${strip.name}, блок ${groupIndex + 1}`;
+                        const duplicateUnit = Boolean(group.uavType && group.unit.trim()) && strip.groups.some((candidate, candidateIndex) => (
+                          candidateIndex !== groupIndex
+                          && candidate.uavType === group.uavType
+                          && normalizedUiLabel(candidate.unit) === normalizedUiLabel(group.unit)
+                        ));
                         const groupCells = groupRowIndex === 0 ? (
                           <>
-                            <td rowSpan={rows.length} className={`strips-group-rowspan-cell${!group.unit.trim() ? " strips-warning-cell" : ""}`}>
+                            <td rowSpan={rows.length} className={`strips-group-rowspan-cell${!group.unit.trim() || duplicateUnit ? " strips-warning-cell" : ""}`}>
                               <div className="strips-group-cell">
                                 <input
                                   aria-label={`${groupLabel}: підрозділ`}
@@ -923,7 +993,7 @@ export default function StripsWorkspace() {
                                   <CustomSelect<UavType>
                                     ariaLabel={`${groupLabel}: тип БпЛА`}
                                     value={group.uavType}
-                                    options={uavOptions}
+                                    options={availableUavOptions(strip, groupIndex)}
                                     onChange={(value) => updateTypeRun(strip.id, group.id, value)}
                                   />
                                   {group.uavType && (
@@ -959,6 +1029,7 @@ export default function StripsWorkspace() {
                                 crew={row.crew}
                                 label={label}
                                 neutral
+                                invalidName={duplicateCrewNames.has(normalizedUiLabel(row.crew.name))}
                                 onUpdate={(field, value) => updateCrew(strip.id, group.id, null, row.crew.id, (current) => ({ ...current, [field]: value }))}
                                 onReadiness={(value) => requestCrewReadiness(strip.id, group.id, null, row.crew, value)}
                                 onRemove={() => setPendingConfirmation({
@@ -1015,6 +1086,7 @@ export default function StripsWorkspace() {
                               <CrewCells
                                 crew={crew}
                                 label={label}
+                                invalidName={duplicateCrewNames.has(normalizedUiLabel(crew.name))}
                                 onUpdate={(field, value) => updateCrew(strip.id, group.id, position.id, crew.id, (current) => ({ ...current, [field]: value }))}
                                 onReadiness={(value) => requestCrewReadiness(strip.id, group.id, position.id, crew, value)}
                                 onDetach={() => updateGroup(strip.id, group.id, (current) => detachCrew(current, position.id, crew.id))}

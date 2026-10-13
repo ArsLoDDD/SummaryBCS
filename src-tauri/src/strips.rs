@@ -1,6 +1,9 @@
 use crate::xlsx;
 use serde::Deserialize;
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 const SHEET_NAME: &str = "Позиції по смугах";
 const UAV_TYPES: [&str; 7] = [
@@ -15,6 +18,8 @@ const UAV_TYPES: [&str; 7] = [
 const CREW_READINESS: [&str; 3] = ["БГ", "Не БГ", "Формується"];
 const POSITION_READINESS: [&str; 2] = ["БГ", "Не БГ"];
 const CREW_DUTIES: [&str; 2] = ["БЧ", "Відпочинок після БЧ"];
+const POSITION_WITHOUT_CREW_NOTE: &str = "Позиція готова до роботи, відсутній екіпаж";
+const CREW_WITHOUT_POSITION_NOTE: &str = "Екіпаж готовий до виконання задач, відсутня позиція";
 
 const STYLE_TITLE: usize = 1;
 const STYLE_SUBTITLE: usize = 2;
@@ -237,6 +242,7 @@ fn prepare_request(request: StripsExportRequest) -> Result<PreparedReport, Strin
     }
 
     let mut identifiers = HashSet::new();
+    let mut crew_names = HashMap::new();
     let mut group_count = 0usize;
     let mut position_count = 0usize;
     let mut crew_count = 0usize;
@@ -255,6 +261,9 @@ fn prepare_request(request: StripsExportRequest) -> Result<PreparedReport, Strin
             .checked_add(strip.groups.len())
             .ok_or_else(|| "Кількість груп завелика.".to_string())?;
         let mut groups = Vec::with_capacity(strip.groups.len());
+        let mut seen_type_runs = HashSet::new();
+        let mut units_by_type = HashSet::new();
+        let mut previous_uav_type = String::new();
         for (group_index, group) in strip.groups.into_iter().enumerate() {
             let group_label = format!("{name}, група {}", group_index + 1);
             register_id(&mut identifiers, &group.id, &format!("ID: {group_label}"))?;
@@ -269,6 +278,21 @@ fn prepare_request(request: StripsExportRequest) -> Result<PreparedReport, Strin
                 &UAV_TYPES,
                 &format!("Тип БпЛА: {group_label}"),
             )?;
+            let type_key = normalize(&uav_type);
+            if type_key != previous_uav_type {
+                if !seen_type_runs.insert(type_key.clone()) {
+                    return Err(format!(
+                        "{group_label}: тип БпЛА «{uav_type}» уже доданий у цій смузі. Додавайте підрозділи до спільного блоку типу."
+                    ));
+                }
+                previous_uav_type = type_key.clone();
+            }
+            let unit_key = format!("{type_key}\0{}", normalize(&unit));
+            if !units_by_type.insert(unit_key) {
+                return Err(format!(
+                    "{group_label}: підрозділ «{unit}» уже доданий до типу «{uav_type}»."
+                ));
+            }
 
             position_count = position_count
                 .checked_add(group.positions.len())
@@ -338,6 +362,7 @@ fn prepare_request(request: StripsExportRequest) -> Result<PreparedReport, Strin
                     let crew_label = format!("{position_label}, екіпаж {}", crew_index + 1);
                     register_id(&mut identifiers, &crew.id, &format!("ID: {crew_label}"))?;
                     let crew = prepare_crew(crew, &crew_label)?;
+                    register_crew_name(&mut crew_names, &crew.name, &crew_label)?;
                     if crew.readiness == "Формується" {
                         return Err(format!(
                             "{crew_label}: екіпаж, що формується, не може бути закріплений за позицією."
@@ -350,6 +375,18 @@ fn prepare_request(request: StripsExportRequest) -> Result<PreparedReport, Strin
                     }
                     crews.push(crew);
                 }
+
+                let note = sync_system_note(
+                    &note,
+                    POSITION_WITHOUT_CREW_NOTE,
+                    readiness == "БГ" && crews.is_empty(),
+                );
+                let note = validate_text(
+                    &note,
+                    &format!("Примітка позиції: {position_label}"),
+                    1_000,
+                    false,
+                )?;
 
                 positions.push(PreparedPosition {
                     name: position_name,
@@ -370,7 +407,7 @@ fn prepare_request(request: StripsExportRequest) -> Result<PreparedReport, Strin
             for (crew_index, crew) in group.loose_crews.into_iter().enumerate() {
                 let crew_label = format!("{group_label}, екіпаж без позиції {}", crew_index + 1);
                 register_id(&mut identifiers, &crew.id, &format!("ID: {crew_label}"))?;
-                let crew = prepare_crew(
+                let mut crew = prepare_crew(
                     StripCrew {
                         id: crew.id,
                         name: crew.name,
@@ -381,6 +418,18 @@ fn prepare_request(request: StripsExportRequest) -> Result<PreparedReport, Strin
                         note: crew.note,
                     },
                     &crew_label,
+                )?;
+                register_crew_name(&mut crew_names, &crew.name, &crew_label)?;
+                crew.note = sync_system_note(
+                    &crew.note,
+                    CREW_WITHOUT_POSITION_NOTE,
+                    crew.readiness == "БГ",
+                );
+                crew.note = validate_text(
+                    &crew.note,
+                    &format!("Примітка екіпажу: {crew_label}"),
+                    1_000,
+                    false,
                 )?;
                 loose_crews.push(PreparedLooseCrew { crew });
             }
@@ -472,6 +521,39 @@ fn register_id(ids: &mut HashSet<String>, value: &str, label: &str) -> Result<()
     Ok(())
 }
 
+fn register_crew_name(
+    names: &mut HashMap<String, String>,
+    value: &str,
+    label: &str,
+) -> Result<(), String> {
+    let key = normalize(value);
+    if let Some(previous) = names.get(&key) {
+        return Err(format!(
+            "{label}: назва екіпажу «{value}» уже використана в «{previous}». Екіпаж може бути лише в одному місці."
+        ));
+    }
+    names.insert(key, label.to_string());
+    Ok(())
+}
+
+fn sync_system_note(note: &str, system_note: &str, required: bool) -> String {
+    let user_note = note
+        .lines()
+        .filter(|line| line.trim() != system_note)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    if !required {
+        return user_note;
+    }
+    if user_note.is_empty() {
+        system_note.to_string()
+    } else {
+        format!("{system_note}\n{user_note}")
+    }
+}
+
 fn validate_text(
     value: &str,
     label: &str,
@@ -548,6 +630,7 @@ fn calculate_summary(strips: &[PreparedStrip]) -> StripsSummary {
     let mut crew_counts = [StatusCounts::default(); UAV_TYPES.len()];
     let mut position_counts = [StatusCounts::default(); UAV_TYPES.len()];
     let mut exception_counts = [ExceptionCounts::default(); UAV_TYPES.len()];
+    let mut seen_crew_names = HashSet::new();
 
     for strip in strips {
         for group in &strip.groups {
@@ -559,12 +642,16 @@ fn calculate_summary(strips: &[PreparedStrip]) -> StripsSummary {
                 }
                 add_status(&mut position_counts[type_index], &position.readiness);
                 for crew in &position.crews {
-                    add_status(&mut crew_counts[type_index], &crew.readiness);
+                    if seen_crew_names.insert(normalize(&crew.name)) {
+                        add_status(&mut crew_counts[type_index], &crew.readiness);
+                    }
                 }
             }
             for crew in &group.loose_crews {
-                add_status(&mut crew_counts[type_index], &crew.crew.readiness);
-                exception_counts[type_index].crews_without_position += 1;
+                if seen_crew_names.insert(normalize(&crew.crew.name)) {
+                    add_status(&mut crew_counts[type_index], &crew.crew.readiness);
+                    exception_counts[type_index].crews_without_position += 1;
+                }
             }
         }
     }
@@ -1638,6 +1725,57 @@ mod tests {
     }
 
     #[test]
+    fn rejects_repeated_type_runs_units_and_crew_names() {
+        let mut repeated_type = request("report.xlsx".into());
+        repeated_type.strips[0].groups[2].uav_type = "ФПВ".into();
+        let error = prepare_request(repeated_type).unwrap_err();
+        assert!(error.contains("тип БпЛА «ФПВ» уже доданий"));
+
+        let mut repeated_unit = request("report.xlsx".into());
+        repeated_unit.strips[0].groups[1].uav_type = "ФПВ".into();
+        let error = prepare_request(repeated_unit).unwrap_err();
+        assert!(error.contains("підрозділ «1 РУБАК» уже доданий"));
+
+        let mut repeated_crew = request("report.xlsx".into());
+        repeated_crew.strips[0].groups[2].loose_crews[0].name = "  АЛЬФА ".into();
+        let error = prepare_request(repeated_crew).unwrap_err();
+        assert!(error.contains("Екіпаж може бути лише в одному місці"));
+    }
+
+    #[test]
+    fn adds_system_notes_and_preserves_user_notes() {
+        let mut value = request("report.xlsx".into());
+        let empty_position = &mut value.strips[0].groups[1].positions[0];
+        empty_position.readiness = "БГ".into();
+        empty_position.not_ready_reason.clear();
+        empty_position.note = "Користувацька примітка позиції".into();
+        let loose = &mut value.strips[0].groups[2].loose_crews[0];
+        loose.readiness = "БГ".into();
+        loose.duty = "БЧ".into();
+        loose.note = "Користувацька примітка екіпажу".into();
+
+        let prepared = prepare_request(value).unwrap();
+        assert_eq!(
+            prepared.strips[0].groups[1].positions[0].note,
+            format!("{POSITION_WITHOUT_CREW_NOTE}\nКористувацька примітка позиції")
+        );
+        assert_eq!(
+            prepared.strips[0].groups[2].loose_crews[0].crew.note,
+            format!("{CREW_WITHOUT_POSITION_NOTE}\nКористувацька примітка екіпажу")
+        );
+    }
+
+    #[test]
+    fn summary_never_counts_a_repeated_crew_name_twice() {
+        let mut prepared = prepare_request(request("report.xlsx".into())).unwrap();
+        prepared.strips[0].groups[2].loose_crews[0].crew.name = " АЛЬФА ".into();
+        let summary = calculate_summary(&prepared.strips);
+
+        assert_eq!(summary.crew_totals.total, 2);
+        assert_eq!(summary.exception_totals.crews_without_position, 0);
+    }
+
+    #[test]
     fn exports_one_sheet_with_merges_colors_reasons_and_uppercase_area() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("strips.xlsx");
@@ -1733,6 +1871,7 @@ mod tests {
     fn merges_one_uav_type_across_consecutive_units() {
         let mut value = request("report.xlsx".into());
         value.strips[0].groups[1].uav_type = "ФПВ".into();
+        value.strips[0].groups[1].unit = "2 РУБАК".into();
         let prepared = prepare_request(value).unwrap();
         let sheet = build_sheet(&prepared, &calculate_summary(&prepared.strips));
 
