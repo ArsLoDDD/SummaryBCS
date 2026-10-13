@@ -15,6 +15,7 @@ import {
   X,
 } from "lucide-react";
 import CustomSelect, { type CustomSelectOption } from "./CustomSelect";
+import StripsRegistry from "./StripsRegistry";
 import { UAV_TYPES } from "./structure";
 import {
   CREW_DUTIES,
@@ -540,6 +541,7 @@ export default function StripsWorkspace() {
   const [pendingReason, setPendingReason] = useState<PendingReason | null>(null);
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [pendingLink, setPendingLink] = useState<PendingLink | null>(null);
+  const [activeView, setActiveView] = useState<"table" | "registry">("table");
   const [tableZoom, setTableZoom] = useState(80);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -884,6 +886,20 @@ export default function StripsWorkspace() {
       )}
 
       <section className="workspace-panel strips-document-panel">
+        <nav className="strips-view-tabs" aria-label="Спосіб заповнення">
+          <button
+            type="button"
+            className={activeView === "table" ? "active" : ""}
+            aria-current={activeView === "table" ? "page" : undefined}
+            onClick={() => setActiveView("table")}
+          >Таблиця</button>
+          <button
+            type="button"
+            className={activeView === "registry" ? "active" : ""}
+            aria-current={activeView === "registry" ? "page" : undefined}
+            onClick={() => setActiveView("registry")}
+          >Реєстр</button>
+        </nav>
         <div className="bcs-toolbar strips-toolbar">
           <button type="button" className="secondary-button" onClick={addStrip}><Plus size={16} /> Додати смугу</button>
           <label className="strips-toolbar-date">
@@ -894,15 +910,18 @@ export default function StripsWorkspace() {
               onChange={(event) => setReport((current) => ({ ...current, reportDate: event.target.value }))}
             />
           </label>
-          <div className="bcs-zoom-control" aria-label="Масштаб таблиці">
-            <span>Масштаб</span>
-            <button type="button" aria-label="Зменшити масштаб" onClick={() => changeTableZoom(-1)} disabled={tableZoom === TABLE_ZOOM_STEPS[0]}><Minus size={15} /></button>
-            <output>{tableZoom}%</output>
-            <button type="button" aria-label="Збільшити масштаб" onClick={() => changeTableZoom(1)} disabled={tableZoom === TABLE_ZOOM_STEPS[TABLE_ZOOM_STEPS.length - 1]}><Plus size={15} /></button>
-          </div>
+          {activeView === "table" && (
+            <div className="bcs-zoom-control" aria-label="Масштаб таблиці">
+              <span>Масштаб</span>
+              <button type="button" aria-label="Зменшити масштаб" onClick={() => changeTableZoom(-1)} disabled={tableZoom === TABLE_ZOOM_STEPS[0]}><Minus size={15} /></button>
+              <output>{tableZoom}%</output>
+              <button type="button" aria-label="Збільшити масштаб" onClick={() => changeTableZoom(1)} disabled={tableZoom === TABLE_ZOOM_STEPS[TABLE_ZOOM_STEPS.length - 1]}><Plus size={15} /></button>
+            </div>
+          )}
         </div>
 
-        <div className="strips-table-scroll">
+        {activeView === "table" ? (
+          <div className="strips-table-scroll">
           <div className="strips-table-scale" style={{ "--strips-table-zoom": tableZoom / 100 } as CSSProperties}>
             <div className="strips-sheet-title">
               <strong>Позиції та екіпажі по смугах</strong>
@@ -1174,7 +1193,32 @@ export default function StripsWorkspace() {
 
             <SummaryTables summary={summary} />
           </div>
-        </div>
+          </div>
+        ) : (
+          <StripsRegistry
+            report={report}
+            duplicateCrewNames={duplicateCrewNames}
+            normalizeLabel={normalizedUiLabel}
+            uavOptionsForGroup={availableUavOptions}
+            updateStrip={updateStrip}
+            updateGroup={updateGroup}
+            updatePosition={updatePosition}
+            updateCrew={updateCrew}
+            updateTypeRun={updateTypeRun}
+            addUnitToType={addUnitToType}
+            requestPositionReadiness={requestPositionReadiness}
+            requestCrewReadiness={requestCrewReadiness}
+            removeStrip={removeStrip}
+            moveStrip={moveStrip}
+            confirmDelete={(label, action) => setPendingConfirmation({
+              title: "Підтвердьте видалення",
+              label,
+              confirmLabel: "Видалити",
+              danger: true,
+              action,
+            })}
+          />
+        )}
       </section>
 
       <footer className="export-bar strips-export-bar">
