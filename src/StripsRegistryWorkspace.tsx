@@ -1,53 +1,107 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
-import { Download, Link2, LoaderCircle, Minus, Plus, Trash2, Unlink2, X } from "lucide-react";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import {
+  ArrowDown,
+  ArrowUp,
+  Download,
+  FileUp,
+  Link2,
+  LoaderCircle,
+  Minus,
+  Pencil,
+  Plus,
+  RotateCcw,
+  Search,
+  Trash2,
+  Unlink2,
+  X,
+} from "lucide-react";
 import CustomSelect, { type CustomSelectOption } from "./CustomSelect";
+import RegistryHistoryInput from "./RegistryHistoryInput";
+import StripsReportView from "./StripsReportView";
+import { collectRegistryHistory } from "./registryHistory";
 import { UAV_TYPES } from "./structure";
 import {
   CREW_DUTIES,
   CREW_READINESS,
   POSITION_READINESS,
-  calculateStripsSummary,
   readinessDisplay,
   upperUk,
   validateStripsReportErrors,
   type CrewDuty,
   type CrewReadiness,
   type PositionReadiness,
-  type StripCrew,
-  type StripPosition,
-  type StripsReport,
   type UavType,
 } from "./strips";
 import {
+  createDemoStripsRegistry,
   createEmptyStripsRegistry,
   createRegistryAssignment,
   createRegistryCrew,
   createRegistryPosition,
-  effectiveCrewLocation,
+  isEffectivelyEmptyStripsRegistry,
   normalizeStripsRegistry,
   positionForCrew,
   registryToStripsReport,
   validateStripsRegistry,
-  type RegistryAssignment,
   type RegistryCrew,
   type RegistryPosition,
   type StripsRegistryData,
 } from "./stripsRegistry";
+import {
+  buildRegistryGeneralRows,
+  collectRegistryTableFilterOptions,
+  registryGeneralRowNote,
+  viewRegistryCrews,
+  viewRegistryGeneralRows,
+  viewRegistryPositions,
+  type RegistryAssignmentState,
+  type RegistryCrewSortKey,
+  type RegistryGeneralSortKey,
+  type RegistryPositionSortKey,
+  type RegistrySortDirection,
+  type RegistryTableFilters,
+} from "./registryTableView";
 
-type RegistryTab = "crews" | "positions" | "overview";
-type ReasonTarget = { kind: "crew" | "position"; id: string };
+type MainTab = "data" | "report";
+type DataTab = "general" | "crews" | "positions";
+type RecordEditor =
+  | { kind: "crew"; isNew: boolean; value: RegistryCrew }
+  | { kind: "position"; isNew: boolean; value: RegistryPosition };
 
-interface PendingReason {
-  target: ReasonTarget;
-  value: string;
+interface AssignmentEditor {
+  id: string | null;
+  crewId: string;
+  positionId: string;
 }
 
 interface PendingConfirmation {
   title: string;
   label: string;
   action: () => void;
+  confirmLabel?: string;
+  tone?: "danger" | "primary";
+}
+
+interface RegistryFilterState {
+  strip: string;
+  unit: string;
+  uavType: string;
+  crewReadiness: string;
+  positionReadiness: string;
+  assignmentState: RegistryAssignmentState | "";
+}
+
+interface RegistrySortState<Key extends string> {
+  key: Key;
+  direction: RegistrySortDirection;
+}
+
+interface RegistrySortStates {
+  general: RegistrySortState<RegistryGeneralSortKey>;
+  crews: RegistrySortState<RegistryCrewSortKey>;
+  positions: RegistrySortState<RegistryPositionSortKey>;
 }
 
 const TABLE_ZOOM_STEPS = [60, 70, 80, 90, 100, 110, 125] as const;
@@ -56,6 +110,76 @@ const DUTY_OPTIONS: ReadonlyArray<CustomSelectOption<CrewDuty>> = [
   ...CREW_DUTIES.map((value) => ({ value, label: value })),
   { value: "Формується", label: "Формується" },
 ];
+const INITIAL_FILTERS: RegistryFilterState = {
+  strip: "",
+  unit: "",
+  uavType: "",
+  crewReadiness: "",
+  positionReadiness: "",
+  assignmentState: "",
+};
+const INITIAL_SORTS: RegistrySortStates = {
+  general: { key: "crew", direction: "asc" },
+  crews: { key: "name", direction: "asc" },
+  positions: { key: "name", direction: "asc" },
+};
+const TABLE_FILTER_DEBOUNCE_MS = 250;
+const GENERAL_SORT_OPTIONS: ReadonlyArray<CustomSelectOption<RegistryGeneralSortKey>> = [
+  { value: "crew", label: "Екіпаж" },
+  { value: "position", label: "Позиція" },
+  { value: "strip", label: "Смуга" },
+  { value: "unit", label: "Підрозділ" },
+  { value: "uavType", label: "Тип БпЛА" },
+  { value: "crewReadiness", label: "БГ екіпажу" },
+  { value: "positionReadiness", label: "БГ позиції" },
+  { value: "assignmentState", label: "Стан зв’язку" },
+];
+const CREW_SORT_OPTIONS: ReadonlyArray<CustomSelectOption<RegistryCrewSortKey>> = [
+  { value: "name", label: "Назва екіпажу" },
+  { value: "unit", label: "Підрозділ" },
+  { value: "uavType", label: "Тип БпЛА" },
+  { value: "readiness", label: "БГ" },
+  { value: "duty", label: "БЧ" },
+  { value: "assets", label: "Засіб" },
+  { value: "strip", label: "Смуга позиції" },
+  { value: "position", label: "Позиція" },
+  { value: "note", label: "Примітки" },
+  { value: "assignmentState", label: "Стан зв’язку" },
+];
+const POSITION_SORT_OPTIONS: ReadonlyArray<CustomSelectOption<RegistryPositionSortKey>> = [
+  { value: "name", label: "Назва позиції" },
+  { value: "strip", label: "Смуга" },
+  { value: "unit", label: "Підрозділ" },
+  { value: "uavType", label: "Тип БпЛА" },
+  { value: "readiness", label: "БГ" },
+  { value: "bro", label: "БРО" },
+  { value: "area", label: "Район" },
+  { value: "direction", label: "Напрямок" },
+  { value: "note", label: "Примітки" },
+  { value: "assignmentState", label: "Стан зв’язку" },
+];
+
+function filterSelectOptions(values: ReadonlyArray<string>): ReadonlyArray<CustomSelectOption<string>> {
+  return [{ value: "", label: "Усі" }, ...values.map((value) => ({ value, label: value }))];
+}
+
+function assignmentFilterOptions(
+  tab: DataTab,
+  available: ReadonlyArray<RegistryAssignmentState>,
+): ReadonlyArray<CustomSelectOption<string>> {
+  const labels: Record<RegistryAssignmentState, string> = {
+    assigned: "Пов’язані",
+    "crew-without-position": "Екіпажі без позиції",
+    "position-without-crew": "Позиції без екіпажу",
+  };
+  return [
+    { value: "", label: "Усі" },
+    ...available
+      .filter((state) => !(tab === "crews" && state === "position-without-crew")
+        && !(tab === "positions" && state === "crew-without-position"))
+      .map((state) => ({ value: state, label: labels[state] })),
+  ];
+}
 
 function tomorrow(): string {
   const date = new Date();
@@ -66,6 +190,16 @@ function tomorrow(): string {
   return `${year}-${month}-${day}`;
 }
 
+function initialRegistryData(): StripsRegistryData {
+  const reportDate = tomorrow();
+  const demoRequested = import.meta.env.DEV
+    && typeof window !== "undefined"
+    && new URLSearchParams(window.location.search).get("demo") === "registry";
+  return demoRequested
+    ? createDemoStripsRegistry(reportDate)
+    : createEmptyStripsRegistry(reportDate);
+}
+
 function formatDate(value: string): string {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
   return match ? `${match[3]}.${match[2]}.${match[1]}` : value;
@@ -74,7 +208,7 @@ function formatDate(value: string): string {
 function messageFrom(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;
-  return "Не вдалося створити файл.";
+  return "Не вдалося виконати операцію.";
 }
 
 function validationCountLabel(count: number): string {
@@ -86,6 +220,38 @@ function validationCountLabel(count: number): string {
   return `${count} помилок`;
 }
 
+function normalizedLabel(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLocaleLowerCase("uk-UA");
+}
+
+function filterValueExists(values: ReadonlyArray<string>, value: string): boolean {
+  return !value || values.some((option) => normalizedLabel(option) === normalizedLabel(value));
+}
+
+function reconcileRegistryFilters(
+  current: RegistryFilterState,
+  options: ReturnType<typeof collectRegistryTableFilterOptions>,
+  tab: DataTab,
+): RegistryFilterState {
+  const next: RegistryFilterState = {
+    strip: filterValueExists(options.strips, current.strip) ? current.strip : "",
+    unit: filterValueExists(options.units, current.unit) ? current.unit : "",
+    uavType: filterValueExists(options.uavTypes, current.uavType) ? current.uavType : "",
+    crewReadiness: tab !== "positions" && filterValueExists(options.crewReadiness, current.crewReadiness)
+      ? current.crewReadiness
+      : "",
+    positionReadiness: tab !== "crews" && filterValueExists(options.positionReadiness, current.positionReadiness)
+      ? current.positionReadiness
+      : "",
+    assignmentState: current.assignmentState && !options.assignmentStates.includes(current.assignmentState)
+      ? ""
+      : current.assignmentState,
+  };
+  return Object.keys(next).every((key) => next[key as keyof RegistryFilterState] === current[key as keyof RegistryFilterState])
+    ? current
+    : next;
+}
+
 function statusClass(status: string): string {
   if (status === "БГ") return "status-ready";
   if (status === "Не БГ") return "status-not-ready";
@@ -93,55 +259,47 @@ function statusClass(status: string): string {
   return "status-neutral";
 }
 
+function assignmentProblem(crew: RegistryCrew | null, position: RegistryPosition | null): string {
+  if (!crew || !position) return "Оберіть екіпаж і позицію.";
+  if (crew.readiness === "Формується") return "Екіпаж зі статусом «Формується» не може мати позицію.";
+  if (crew.readiness && position.readiness && crew.readiness !== position.readiness) {
+    return "Статус екіпажу має збігатися зі статусом позиції.";
+  }
+  if (crew.unit && position.unit && normalizedLabel(crew.unit) !== normalizedLabel(position.unit)) {
+    return "Підрозділ екіпажу має збігатися з підрозділом позиції.";
+  }
+  if (crew.uavType && position.uavType && crew.uavType !== position.uavType) {
+    return "Тип БпЛА екіпажу має збігатися з типом БпЛА позиції.";
+  }
+  return "";
+}
+
+function crewReadinessOptions(crew: RegistryCrew): ReadonlyArray<CustomSelectOption<CrewReadiness>> {
+  return CREW_READINESS.map((value) => ({
+    value,
+    label: value === "Не БГ" ? readinessDisplay(value, crew.notReadyReason) : value,
+  }));
+}
+
+function positionReadinessOptions(position: RegistryPosition): ReadonlyArray<CustomSelectOption<PositionReadiness>> {
+  return POSITION_READINESS.map((value) => ({
+    value,
+    label: value === "Не БГ" ? readinessDisplay(value, position.notReadyReason) : value,
+  }));
+}
+
 function Notification({ kind, children }: { kind: "error" | "success"; children: ReactNode }) {
   return <div className={`message ${kind}`} role={kind === "error" ? "alert" : "status"}>{children}</div>;
 }
 
-function ReasonModal({
-  value,
-  onChange,
-  onCancel,
-  onSave,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  onCancel: () => void;
-  onSave: () => void;
-}) {
-  const inputRef = useRef<HTMLTextAreaElement>(null);
+function StatusBadge({ value, reason = "" }: { value: string; reason?: string }) {
+  const label = value ? readinessDisplay(value as CrewReadiness, reason) : "Не вказано";
+  return <span className={`registry-status-badge ${statusClass(value)}`} title={label}>{label}</span>;
+}
 
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onCancel();
-      } else if (event.key === "Enter" && !event.shiftKey && !event.isComposing && !event.repeat) {
-        event.preventDefault();
-        if (value.trim()) onSave();
-      }
-    }
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [onCancel, onSave, value]);
-
-  return (
-    <div className="reason-modal-backdrop" role="presentation" onMouseDown={onCancel}>
-      <section className="reason-modal" role="dialog" aria-modal="true" aria-labelledby="registry-reason-title" onMouseDown={(event) => event.stopPropagation()}>
-        <button type="button" className="reason-modal-close" aria-label="Закрити" onClick={onCancel}><X size={18} /></button>
-        <h2 id="registry-reason-title">Причина статусу «Не БГ»</h2>
-        <p>Статус буде змінено тільки після збереження причини.</p>
-        <textarea ref={inputRef} value={value} maxLength={500} rows={4} onChange={(event) => onChange(event.target.value)} placeholder="Наприклад: екіпаж виведено з позиції" />
-        <div className="reason-modal-actions">
-          <button type="button" className="secondary-button" onClick={onCancel}>Скасувати</button>
-          <button type="button" className="primary-button" disabled={!value.trim()} onClick={onSave}>Зберегти</button>
-        </div>
-      </section>
-    </div>
-  );
+function LedgerValue({ children, muted = false, title }: { children: ReactNode; muted?: boolean; title?: string }) {
+  const text = typeof children === "string" ? children : undefined;
+  return <span className={`registry-ledger-value${muted ? " muted" : ""}`} title={title ?? text}>{children || "—"}</span>;
 }
 
 function ConfirmationModal({ value, onCancel, onConfirm }: {
@@ -171,95 +329,220 @@ function ConfirmationModal({ value, onCancel, onConfirm }: {
         <p>{value.label}</p>
         <div className="reason-modal-actions">
           <button type="button" className="secondary-button" onClick={onCancel}>Скасувати</button>
-          <button type="button" className="secondary-button danger-button" onClick={onConfirm}>Видалити</button>
+          <button
+            type="button"
+            className={value.tone === "primary" ? "primary-button" : "secondary-button danger-button"}
+            onClick={onConfirm}
+          >
+            {value.confirmLabel ?? "Видалити"}
+          </button>
         </div>
       </section>
     </div>
   );
 }
 
-function crewReadinessOptions(crew: RegistryCrew): ReadonlyArray<CustomSelectOption<CrewReadiness>> {
-  return CREW_READINESS.map((value) => ({
-    value,
-    label: value === "Не БГ" ? readinessDisplay(value, crew.notReadyReason) : value,
-  }));
-}
+function RecordEditorModal({ editor, data, onChange, onCancel, onSave }: {
+  editor: RecordEditor;
+  data: StripsRegistryData;
+  onChange: (editor: RecordEditor) => void;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        const target = event.target instanceof Element ? event.target : null;
+        if (target?.closest('[role="combobox"][aria-expanded="true"]')) return;
+        event.preventDefault();
+        onCancel();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [onCancel]);
 
-function positionReadinessOptions(position: RegistryPosition): ReadonlyArray<CustomSelectOption<PositionReadiness>> {
-  return POSITION_READINESS.map((value) => ({
-    value,
-    label: value === "Не БГ" ? readinessDisplay(value, position.notReadyReason) : value,
-  }));
-}
+  const missingReason = editor.value.readiness === "Не БГ" && !editor.value.notReadyReason.trim();
+  const history = useMemo(() => collectRegistryHistory(data), [data]);
 
-function ReadonlyValue({ children, muted = false }: { children: ReactNode; muted?: boolean }) {
-  return <span className={`registry-readonly-value${muted ? " muted" : ""}`}>{children || "—"}</span>;
-}
-
-interface PreviewRow {
-  key: string;
-  crew: StripCrew | null;
-  position: StripPosition | null;
-}
-
-function PreviewTable({ report }: { report: StripsReport }) {
   return (
-    <div className="registry-preview-sections">
-      {report.strips.length === 0 && <p className="registry-empty">Після додавання екіпажів або позицій тут автоматично з’явиться сформована таблиця.</p>}
-      {report.strips.map((strip) => (
-        <section className="registry-preview-strip" key={strip.id}>
-          <h3>{strip.name || "Смуга без назви"}</h3>
-          <table className="registry-preview-table">
-            <thead>
-              <tr>
-                <th>Підрозділ</th><th>Тип БпЛА</th><th>Назва екіпажу</th><th>БГ екіпажу</th>
-                <th>БЧ екіпажу</th><th>Засіб</th><th>Позиція</th><th>БГ позиції</th>
-                <th>БРО</th><th>Район</th><th>Напрямок роботи</th><th>Примітки</th>
-              </tr>
-            </thead>
-            <tbody>
-              {strip.groups.flatMap((group) => {
-                const linked = group.positions.flatMap<PreviewRow>((position) => {
-                  if (position.crews.length === 0) {
-                    return [{ key: position.id, crew: null, position }];
-                  }
-                  return position.crews.map((crew) => ({ key: `${position.id}-${crew.id}`, crew, position }));
-                });
-                const loose: PreviewRow[] = group.looseCrews.map((crew) => ({ key: crew.id, crew, position: null }));
-                return [...linked, ...loose].map(({ key, crew, position }) => {
-                  const tone = crew && position
-                    ? statusClass(crew.readiness || position.readiness)
-                    : "status-neutral";
-                  return (
-                    <tr key={key} className={tone}>
-                      <td>{group.unit || "—"}</td>
-                      <td>{group.uavType || "—"}</td>
-                      <td>{crew?.name || "Позиція без екіпажу"}</td>
-                      <td>{crew ? readinessDisplay(crew.readiness, crew.notReadyReason) : "—"}</td>
-                      <td>{crew?.duty || "—"}</td>
-                      <td>{crew?.assets || "—"}</td>
-                      <td>{position?.name || "Екіпаж без позиції"}</td>
-                      <td>{position ? readinessDisplay(position.readiness, position.notReadyReason) : "—"}</td>
-                      <td>{position?.bro || "—"}</td>
-                      <td>{position?.area || "—"}</td>
-                      <td>{position?.direction || "—"}</td>
-                      <td>{position?.note || crew?.note || "—"}</td>
-                    </tr>
-                  );
-                });
-              })}
-            </tbody>
-          </table>
-        </section>
-      ))}
+    <div className="reason-modal-backdrop" role="presentation" onMouseDown={onCancel}>
+      <form className="reason-modal registry-editor-modal" onSubmit={(event) => { event.preventDefault(); if (!missingReason) onSave(); }} onMouseDown={(event) => event.stopPropagation()}>
+        <button type="button" className="reason-modal-close" aria-label="Закрити" onClick={onCancel}><X size={18} /></button>
+        <h2>{editor.isNew ? "Новий запис" : "Редагування"}: {editor.kind === "crew" ? "екіпаж" : "позиція"}</h2>
+        <p>{editor.kind === "crew" ? "Тут зберігаються лише власні дані екіпажу. Дані позиції задаються окремо." : "Тут зберігаються лише дані позиції. Екіпажі приєднуються у вкладці «Загальні»."}</p>
+
+        {editor.kind === "crew" ? (
+          <div className="registry-form-grid">
+            <label className="registry-form-field"><span>Назва екіпажу</span><input autoFocus value={editor.value.name} maxLength={250} onChange={(event) => onChange({ ...editor, value: { ...editor.value, name: event.target.value } })} /></label>
+            <label className="registry-form-field"><span>Підрозділ</span><RegistryHistoryInput ariaLabel="Підрозділ екіпажу" value={editor.value.unit} options={history.units} maxLength={250} onChange={(unit) => onChange({ ...editor, value: { ...editor.value, unit } })} /></label>
+            <label className="registry-form-field"><span>Тип БпЛА</span><CustomSelect<UavType> portal ariaLabel="Тип БпЛА екіпажу" value={editor.value.uavType} options={UAV_OPTIONS} onChange={(uavType) => onChange({ ...editor, value: { ...editor.value, uavType } })} /></label>
+            <label className="registry-form-field"><span>БГ екіпажу</span><CustomSelect<CrewReadiness> portal ariaLabel="БГ екіпажу" value={editor.value.readiness} options={crewReadinessOptions(editor.value)} onChange={(readiness) => onChange({ ...editor, value: { ...editor.value, readiness, notReadyReason: readiness === "Не БГ" ? editor.value.notReadyReason : "", duty: readiness === "Формується" ? "Формується" : editor.value.duty === "Формується" ? "" : editor.value.duty } })} /></label>
+            {editor.value.readiness === "Не БГ" && <label className="registry-form-field registry-form-span-2"><span>Причина «Не БГ»</span><textarea autoFocus value={editor.value.notReadyReason} maxLength={500} rows={3} placeholder="Причина обов’язкова" onChange={(event) => onChange({ ...editor, value: { ...editor.value, notReadyReason: event.target.value } })} /></label>}
+            <label className="registry-form-field"><span>БЧ екіпажу</span><CustomSelect<CrewDuty> portal ariaLabel="БЧ екіпажу" value={editor.value.duty} options={DUTY_OPTIONS} disabled={editor.value.readiness === "Формується"} onChange={(duty) => onChange({ ...editor, value: { ...editor.value, duty } })} /></label>
+            <label className="registry-form-field"><span>Засіб</span><input value={editor.value.assets} maxLength={500} placeholder="Через кому" onChange={(event) => onChange({ ...editor, value: { ...editor.value, assets: event.target.value } })} /></label>
+            <label className="registry-form-field registry-form-span-2"><span>Примітки</span><textarea value={editor.value.note} maxLength={1000} rows={3} onChange={(event) => onChange({ ...editor, value: { ...editor.value, note: event.target.value } })} /></label>
+          </div>
+        ) : (
+          <div className="registry-form-grid">
+            <label className="registry-form-field"><span>Назва позиції</span><input autoFocus value={editor.value.name} maxLength={250} onChange={(event) => onChange({ ...editor, value: { ...editor.value, name: event.target.value } })} /></label>
+            <label className="registry-form-field"><span>Смуга</span><RegistryHistoryInput ariaLabel="Смуга позиції" value={editor.value.strip} options={history.strips} maxLength={200} onChange={(strip) => onChange({ ...editor, value: { ...editor.value, strip } })} /></label>
+            <label className="registry-form-field"><span>Підрозділ</span><RegistryHistoryInput ariaLabel="Підрозділ позиції" value={editor.value.unit} options={history.units} maxLength={250} onChange={(unit) => onChange({ ...editor, value: { ...editor.value, unit } })} /></label>
+            <label className="registry-form-field"><span>Тип БпЛА</span><CustomSelect<UavType> portal ariaLabel="Тип БпЛА позиції" value={editor.value.uavType} options={UAV_OPTIONS} onChange={(uavType) => onChange({ ...editor, value: { ...editor.value, uavType } })} /></label>
+            <label className="registry-form-field"><span>БГ позиції</span><CustomSelect<PositionReadiness> portal ariaLabel="БГ позиції" value={editor.value.readiness} options={positionReadinessOptions(editor.value)} onChange={(readiness) => onChange({ ...editor, value: { ...editor.value, readiness, notReadyReason: readiness === "Не БГ" ? editor.value.notReadyReason : "" } })} /></label>
+            <label className="registry-form-field"><span>БРО</span><RegistryHistoryInput ariaLabel="БРО позиції" value={editor.value.bro} options={history.bros} maxLength={250} onChange={(bro) => onChange({ ...editor, value: { ...editor.value, bro } })} /></label>
+            {editor.value.readiness === "Не БГ" && <label className="registry-form-field registry-form-span-2"><span>Причина «Не БГ»</span><textarea autoFocus value={editor.value.notReadyReason} maxLength={500} rows={3} placeholder="Причина обов’язкова" onChange={(event) => onChange({ ...editor, value: { ...editor.value, notReadyReason: event.target.value } })} /></label>}
+            <label className="registry-form-field"><span>Район</span><input value={editor.value.area} maxLength={250} onChange={(event) => onChange({ ...editor, value: { ...editor.value, area: upperUk(event.target.value) } })} /></label>
+            <label className="registry-form-field"><span>Напрямок роботи</span><textarea value={editor.value.direction} maxLength={500} rows={3} onChange={(event) => onChange({ ...editor, value: { ...editor.value, direction: event.target.value } })} /></label>
+            <label className="registry-form-field registry-form-span-2"><span>Примітки</span><textarea value={editor.value.note} maxLength={1000} rows={3} onChange={(event) => onChange({ ...editor, value: { ...editor.value, note: event.target.value } })} /></label>
+          </div>
+        )}
+
+        {missingReason && <p className="registry-form-error">Без причини статус «Не БГ» не буде збережено.</p>}
+        <div className="reason-modal-actions">
+          <button type="button" className="secondary-button" onClick={onCancel}>Скасувати</button>
+          <button type="submit" className="primary-button" disabled={missingReason}>Зберегти</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function AssignmentEditorModal({ value, data, onChange, onCancel, onSave }: {
+  value: AssignmentEditor;
+  data: StripsRegistryData;
+  onChange: (value: AssignmentEditor) => void;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCancel();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [onCancel]);
+
+  const crew = data.crews.find((item) => item.id === value.crewId) ?? null;
+  const position = data.positions.find((item) => item.id === value.positionId) ?? null;
+  const usedCrewIds = new Set(data.assignments.filter((item) => item.id !== value.id).map((item) => item.crewId));
+  const crewOptions: ReadonlyArray<CustomSelectOption<string>> = data.crews.map((item) => ({
+    value: item.id,
+    label: `${item.name || "Без назви"} — ${item.unit || "підрозділ не вказано"}`,
+    disabled: usedCrewIds.has(item.id),
+  }));
+  const positionOptions: ReadonlyArray<CustomSelectOption<string>> = data.positions.map((item) => {
+    const incompatibility = crew ? assignmentProblem(crew, item) : "";
+    return {
+      value: item.id,
+      label: `${item.name || "Без назви"} — ${item.strip || "смуга не вказана"}${incompatibility ? ` — недоступно: ${incompatibility}` : ""}`,
+      disabled: Boolean(incompatibility),
+    };
+  });
+  const problem = assignmentProblem(crew, position);
+  const compatiblePositionCount = crew
+    ? data.positions.filter((item) => !assignmentProblem(crew, item)).length
+    : 0;
+  const displayedProblem = crew && !position && data.positions.length > 0 && compatiblePositionCount === 0
+    ? "Для цього екіпажу немає сумісних позицій. Мають збігатися статус, підрозділ і тип БпЛА."
+    : problem;
+
+  return (
+    <div className="reason-modal-backdrop" role="presentation" onMouseDown={onCancel}>
+      <form className="reason-modal registry-editor-modal registry-link-editor" onSubmit={(event) => { event.preventDefault(); if (!problem) onSave(); }} onMouseDown={(event) => event.stopPropagation()}>
+        <button type="button" className="reason-modal-close" aria-label="Закрити" onClick={onCancel}><X size={18} /></button>
+        <h2>{value.id ? "Змінити зв’язок" : "Пов’язати екіпаж із позицією"}</h2>
+        <p>Екіпаж і позиція залишаються окремими записами. Тут зберігається лише зв’язок між ними.</p>
+        <div className="registry-form-grid">
+          <label className="registry-form-field"><span>Екіпаж</span><CustomSelect<string> portal ariaLabel="Оберіть екіпаж" value={value.crewId} options={crewOptions} onChange={(crewId) => onChange({ ...value, crewId, positionId: assignmentProblem(data.crews.find((item) => item.id === crewId) ?? null, position) ? "" : value.positionId })} /></label>
+          <label className="registry-form-field"><span>Позиція</span><CustomSelect<string> portal ariaLabel="Оберіть позицію" value={value.positionId} options={positionOptions} disabled={!crew} onChange={(positionId) => onChange({ ...value, positionId })} /></label>
+        </div>
+        {displayedProblem && <p className="registry-form-error">{displayedProblem}</p>}
+        <div className="reason-modal-actions">
+          <button type="button" className="secondary-button" onClick={onCancel}>Скасувати</button>
+          <button type="submit" className="primary-button" disabled={Boolean(problem)}>Зберегти зв’язок</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function RegistryTableControls({
+  tab,
+  search,
+  filters,
+  filterOptions,
+  sortKey,
+  defaultSortKey,
+  sortDirection,
+  sortOptions,
+  onSearch,
+  onFilters,
+  onSortKey,
+  onSortDirection,
+  onReset,
+}: {
+  tab: DataTab;
+  search: string;
+  filters: RegistryFilterState;
+  filterOptions: ReturnType<typeof collectRegistryTableFilterOptions>;
+  sortKey: string;
+  defaultSortKey: string;
+  sortDirection: RegistrySortDirection;
+  sortOptions: ReadonlyArray<CustomSelectOption<string>>;
+  onSearch: (value: string) => void;
+  onFilters: (value: RegistryFilterState) => void;
+  onSortKey: (value: string) => void;
+  onSortDirection: () => void;
+  onReset: () => void;
+}) {
+  const hasActiveFilters = Boolean(
+    search.trim()
+    || filters.strip
+    || filters.unit
+    || filters.uavType
+    || filters.crewReadiness
+    || filters.positionReadiness
+    || filters.assignmentState,
+  );
+
+  return (
+    <div className="registry-view-controls" aria-label="Пошук, сортування і фільтри">
+      <label className="registry-search-control">
+        <span>Пошук</span>
+        <span className="registry-search-input"><Search size={16} aria-hidden="true" /><input value={search} placeholder="Назва, район, БРО, засіб…" onChange={(event) => onSearch(event.target.value)} /></span>
+      </label>
+      <label className="registry-filter-control"><span>Смуга</span><CustomSelect<string> portal ariaLabel="Фільтр за смугою" value={filters.strip} options={filterSelectOptions(filterOptions.strips)} onChange={(strip) => onFilters({ ...filters, strip })} /></label>
+      <label className="registry-filter-control"><span>Підрозділ</span><CustomSelect<string> portal ariaLabel="Фільтр за підрозділом" value={filters.unit} options={filterSelectOptions(filterOptions.units)} onChange={(unit) => onFilters({ ...filters, unit })} /></label>
+      <label className="registry-filter-control"><span>Тип БпЛА</span><CustomSelect<string> portal ariaLabel="Фільтр за типом БпЛА" value={filters.uavType} options={filterSelectOptions(filterOptions.uavTypes)} onChange={(uavType) => onFilters({ ...filters, uavType })} /></label>
+      {(tab === "general" || tab === "crews") && <label className="registry-filter-control"><span>БГ екіпажу</span><CustomSelect<string> portal ariaLabel="Фільтр за готовністю екіпажу" value={filters.crewReadiness} options={filterSelectOptions(filterOptions.crewReadiness)} onChange={(crewReadiness) => onFilters({ ...filters, crewReadiness })} /></label>}
+      {(tab === "general" || tab === "positions") && <label className="registry-filter-control"><span>БГ позиції</span><CustomSelect<string> portal ariaLabel="Фільтр за готовністю позиції" value={filters.positionReadiness} options={filterSelectOptions(filterOptions.positionReadiness)} onChange={(positionReadiness) => onFilters({ ...filters, positionReadiness })} /></label>}
+      <label className="registry-filter-control"><span>Зв’язок</span><CustomSelect<string> portal ariaLabel="Фільтр за станом зв’язку" value={filters.assignmentState} options={assignmentFilterOptions(tab, filterOptions.assignmentStates)} onChange={(assignmentState) => onFilters({ ...filters, assignmentState: assignmentState as RegistryAssignmentState | "" })} /></label>
+      <label className="registry-filter-control registry-sort-control"><span>Сортування</span><CustomSelect<string> portal ariaLabel="Поле сортування" value={sortKey} options={sortOptions} onChange={onSortKey} /></label>
+      <button type="button" className="registry-sort-direction" title={sortDirection === "asc" ? "За зростанням" : "За спаданням"} aria-label={sortDirection === "asc" ? "Сортувати за спаданням" : "Сортувати за зростанням"} onClick={onSortDirection}>
+        {sortDirection === "asc" ? <ArrowUp size={17} /> : <ArrowDown size={17} />}
+      </button>
+      <button
+        type="button"
+        className="registry-reset-filters"
+        title="Скинути пошук, фільтри і сортування"
+        aria-label="Скинути пошук, фільтри і сортування"
+        disabled={!hasActiveFilters && sortKey === defaultSortKey && sortDirection === "asc"}
+        onClick={onReset}
+      ><RotateCcw size={17} /></button>
     </div>
   );
 }
 
 export default function StripsRegistryWorkspace() {
-  const [data, setData] = useState<StripsRegistryData>(() => createEmptyStripsRegistry(tomorrow()));
-  const [activeTab, setActiveTab] = useState<RegistryTab>("crews");
-  const [pendingReason, setPendingReason] = useState<PendingReason | null>(null);
+  const [data, setData] = useState<StripsRegistryData>(initialRegistryData);
+  const [mainTab, setMainTab] = useState<MainTab>("data");
+  const [dataTab, setDataTab] = useState<DataTab>("general");
+  const [editor, setEditor] = useState<RecordEditor | null>(null);
+  const [assignmentEditor, setAssignmentEditor] = useState<AssignmentEditor | null>(null);
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const [tableZoom, setTableZoom] = useState(80);
   const [busy, setBusy] = useState(false);
@@ -268,31 +551,105 @@ export default function StripsRegistryWorkspace() {
   const [donePath, setDonePath] = useState("");
   const [draftReady, setDraftReady] = useState(false);
   const [draftStatus, setDraftStatus] = useState<"saved" | "saving" | "error">("saved");
+  const [tableSearch, setTableSearch] = useState("");
+  const [tableFilters, setTableFilters] = useState<RegistryFilterState>(INITIAL_FILTERS);
+  const [appliedTableSearch, setAppliedTableSearch] = useState("");
+  const [appliedTableFilters, setAppliedTableFilters] = useState<RegistryFilterState>(INITIAL_FILTERS);
+  const [tableSorts, setTableSorts] = useState<RegistrySortStates>(INITIAL_SORTS);
   const contentRef = useRef<HTMLDivElement>(null);
+  const tableViewDebounceRef = useRef<number | null>(null);
+  const tableViewGenerationRef = useRef(0);
   const tauriAvailable = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const modalOpen = Boolean(editor || assignmentEditor || pendingConfirmation);
   const report = useMemo(() => registryToStripsReport(data), [data]);
-  const summary = useMemo(() => calculateStripsSummary(report.strips), [report.strips]);
   const validationErrors = useMemo(() => {
     const registryProblems = validateStripsRegistry(data);
     return registryProblems.length > 0 ? registryProblems : validateStripsReportErrors(report);
   }, [data, report]);
+
+  const generalRows = useMemo(() => buildRegistryGeneralRows(data), [data]);
+  const tableFilterOptions = useMemo(() => collectRegistryTableFilterOptions(data, dataTab), [data, dataTab]);
+  const sharedViewFilters = useMemo<RegistryTableFilters>(() => ({
+    strips: appliedTableFilters.strip ? [appliedTableFilters.strip] : undefined,
+    units: appliedTableFilters.unit ? [appliedTableFilters.unit] : undefined,
+    uavTypes: appliedTableFilters.uavType ? [appliedTableFilters.uavType] : undefined,
+    assignmentStates: appliedTableFilters.assignmentState ? [appliedTableFilters.assignmentState] : undefined,
+  }), [appliedTableFilters.assignmentState, appliedTableFilters.strip, appliedTableFilters.uavType, appliedTableFilters.unit]);
+  const visibleGeneralRows = useMemo(() => viewRegistryGeneralRows(data, {
+    search: appliedTableSearch,
+    filters: {
+      ...sharedViewFilters,
+      crewReadiness: appliedTableFilters.crewReadiness ? [appliedTableFilters.crewReadiness] : undefined,
+      positionReadiness: appliedTableFilters.positionReadiness ? [appliedTableFilters.positionReadiness] : undefined,
+    },
+    sort: tableSorts.general,
+  }), [appliedTableFilters.crewReadiness, appliedTableFilters.positionReadiness, appliedTableSearch, data, sharedViewFilters, tableSorts.general]);
+  const visibleCrews = useMemo(() => viewRegistryCrews(data, {
+    search: appliedTableSearch,
+    filters: {
+      ...sharedViewFilters,
+      crewReadiness: appliedTableFilters.crewReadiness ? [appliedTableFilters.crewReadiness] : undefined,
+    },
+    sort: tableSorts.crews,
+  }), [appliedTableFilters.crewReadiness, appliedTableSearch, data, sharedViewFilters, tableSorts.crews]);
+  const visiblePositions = useMemo(() => viewRegistryPositions(data, {
+    search: appliedTableSearch,
+    filters: {
+      ...sharedViewFilters,
+      positionReadiness: appliedTableFilters.positionReadiness ? [appliedTableFilters.positionReadiness] : undefined,
+    },
+    sort: tableSorts.positions,
+  }), [appliedTableFilters.positionReadiness, appliedTableSearch, data, sharedViewFilters, tableSorts.positions]);
+
+  useEffect(() => {
+    setTableFilters((current) => reconcileRegistryFilters(current, tableFilterOptions, dataTab));
+    setAppliedTableFilters((current) => reconcileRegistryFilters(current, tableFilterOptions, dataTab));
+  }, [dataTab, tableFilterOptions]);
+
+  useEffect(() => {
+    const generation = ++tableViewGenerationRef.current;
+    if (tableViewDebounceRef.current !== null) window.clearTimeout(tableViewDebounceRef.current);
+    const timeout = window.setTimeout(() => {
+      if (generation !== tableViewGenerationRef.current) return;
+      setAppliedTableSearch(tableSearch);
+      setAppliedTableFilters(tableFilters);
+      tableViewDebounceRef.current = null;
+    }, TABLE_FILTER_DEBOUNCE_MS);
+    tableViewDebounceRef.current = timeout;
+    return () => {
+      window.clearTimeout(timeout);
+      if (tableViewDebounceRef.current === timeout) tableViewDebounceRef.current = null;
+    };
+  }, [tableFilters, tableSearch]);
 
   useEffect(() => {
     if (!tauriAvailable) {
       setDraftReady(true);
       return;
     }
+    const seedDemoWhenEmpty = import.meta.env.DEV;
     let disposed = false;
     void invoke<string | null>("load_workspace_draft", { variant: "strips-registry" })
       .then((payload) => {
-        if (disposed || !payload) return;
+        if (disposed) return;
+        if (!payload) {
+          setData(seedDemoWhenEmpty
+            ? createDemoStripsRegistry(tomorrow())
+            : createEmptyStripsRegistry(tomorrow()));
+          setDraftReady(true);
+          return;
+        }
         const restored = normalizeStripsRegistry(JSON.parse(payload));
-        if (restored) setData(restored);
+        if (!restored) {
+          setDraftStatus("error");
+          return;
+        }
+        setData(seedDemoWhenEmpty && isEffectivelyEmptyStripsRegistry(restored)
+          ? createDemoStripsRegistry(restored.reportDate)
+          : restored);
+        setDraftReady(true);
       })
-      .catch(() => setDraftStatus("error"))
-      .finally(() => {
-        if (!disposed) setDraftReady(true);
-      });
+      .catch(() => { if (!disposed) setDraftStatus("error"); });
     return () => { disposed = true; };
   }, [tauriAvailable]);
 
@@ -312,182 +669,21 @@ export default function StripsRegistryWorkspace() {
     const timeout = window.setTimeout(() => setError(""), 10_000);
     return () => window.clearTimeout(timeout);
   }, [error]);
-
   useEffect(() => {
     if (!notice) return;
     const timeout = window.setTimeout(() => setNotice(""), 10_000);
     return () => window.clearTimeout(timeout);
   }, [notice]);
-
   useEffect(() => {
     if (!donePath) return;
     const timeout = window.setTimeout(() => setDonePath(""), 10_000);
     return () => window.clearTimeout(timeout);
   }, [donePath]);
-
   useEffect(() => {
     if (!contentRef.current) return;
     contentRef.current.scrollLeft = 0;
     contentRef.current.scrollTop = 0;
-  }, [activeTab]);
-
-  function updateCrew(crewId: string, update: (crew: RegistryCrew) => RegistryCrew) {
-    setData((current) => ({
-      ...current,
-      crews: current.crews.map((crew) => crew.id === crewId ? update(crew) : crew),
-    }));
-  }
-
-  function updatePosition(positionId: string, update: (position: RegistryPosition) => RegistryPosition) {
-    setData((current) => {
-      const original = current.positions.find((position) => position.id === positionId);
-      if (!original) return current;
-      const changed = update(original);
-      const linkedCrewIds = new Set(
-        current.assignments
-          .filter((assignment) => assignment.positionId === positionId)
-          .map((assignment) => assignment.crewId),
-      );
-      return {
-        ...current,
-        positions: current.positions.map((position) => position.id === positionId ? changed : position),
-        crews: current.crews.map((crew) => linkedCrewIds.has(crew.id) ? {
-          ...crew,
-          strip: changed.strip,
-          unit: changed.unit,
-          uavType: changed.uavType,
-        } : crew),
-      };
-    });
-  }
-
-  function updateAssignment(assignmentId: string, update: (assignment: RegistryAssignment) => RegistryAssignment) {
-    setData((current) => ({
-      ...current,
-      assignments: current.assignments.map((assignment) => assignment.id === assignmentId ? update(assignment) : assignment),
-    }));
-  }
-
-  function detachCrewIfNeeded(crew: RegistryCrew, readiness: CrewReadiness) {
-    const position = positionForCrew(data, crew.id);
-    const mustDetach = readiness === "Формується" || Boolean(position?.readiness && position.readiness !== readiness);
-    if (!mustDetach) return false;
-    setData((current) => ({
-      ...current,
-      assignments: current.assignments.filter((assignment) => assignment.crewId !== crew.id),
-    }));
-    return true;
-  }
-
-  function requestCrewReadiness(crew: RegistryCrew, readiness: CrewReadiness) {
-    if (readiness === "Не БГ") {
-      setPendingReason({ target: { kind: "crew", id: crew.id }, value: crew.readiness === "Не БГ" ? crew.notReadyReason : "" });
-      return;
-    }
-    const detached = detachCrewIfNeeded(crew, readiness);
-    updateCrew(crew.id, (current) => ({
-      ...current,
-      readiness,
-      notReadyReason: "",
-      duty: readiness === "Формується" ? "Формується" : current.duty === "Формується" ? "" : current.duty,
-    }));
-    if (detached) setNotice(`Екіпаж «${crew.name || "Без назви"}» відкріплено від несумісної позиції.`);
-  }
-
-  function requestPositionReadiness(position: RegistryPosition, readiness: PositionReadiness) {
-    if (readiness === "Не БГ") {
-      setPendingReason({ target: { kind: "position", id: position.id }, value: position.readiness === "Не БГ" ? position.notReadyReason : "" });
-      return;
-    }
-    const detachedIds = new Set(
-      data.assignments
-        .filter((assignment) => assignment.positionId === position.id)
-        .filter((assignment) => data.crews.find((crew) => crew.id === assignment.crewId)?.readiness !== readiness)
-        .map((assignment) => assignment.id),
-    );
-    setData((current) => ({
-      ...current,
-      positions: current.positions.map((candidate) => candidate.id === position.id
-        ? { ...candidate, readiness, notReadyReason: "" }
-        : candidate),
-      assignments: current.assignments.filter((assignment) => !detachedIds.has(assignment.id)),
-    }));
-    if (detachedIds.size > 0) setNotice(`Від позиції «${position.name || "Без назви"}» відкріплено несумісні екіпажі.`);
-  }
-
-  function saveNotReadyReason() {
-    if (!pendingReason?.value.trim()) return;
-    const { target, value } = pendingReason;
-    if (target.kind === "crew") {
-      const crew = data.crews.find((item) => item.id === target.id);
-      if (crew) {
-        const detached = detachCrewIfNeeded(crew, "Не БГ");
-        updateCrew(crew.id, (current) => ({
-          ...current,
-          readiness: "Не БГ",
-          notReadyReason: value.trim(),
-          duty: current.duty === "Формується" ? "" : current.duty,
-        }));
-        if (detached) setNotice(`Екіпаж «${crew.name || "Без назви"}» відкріплено від несумісної позиції.`);
-      }
-    } else {
-      const position = data.positions.find((item) => item.id === target.id);
-      if (position) {
-        const detachedIds = new Set(
-          data.assignments
-            .filter((assignment) => assignment.positionId === position.id)
-            .filter((assignment) => data.crews.find((crew) => crew.id === assignment.crewId)?.readiness !== "Не БГ")
-            .map((assignment) => assignment.id),
-        );
-        setData((current) => ({
-          ...current,
-          positions: current.positions.map((candidate) => candidate.id === position.id
-            ? { ...candidate, readiness: "Не БГ", notReadyReason: value.trim() }
-            : candidate),
-          assignments: current.assignments.filter((assignment) => !detachedIds.has(assignment.id)),
-        }));
-        if (detachedIds.size > 0) setNotice(`Від позиції «${position.name || "Без назви"}» відкріплено несумісні екіпажі.`);
-      }
-    }
-    setPendingReason(null);
-  }
-
-  function chooseAssignmentCrew(assignment: RegistryAssignment, crewId: string) {
-    const crew = data.crews.find((item) => item.id === crewId);
-    const currentPosition = data.positions.find((item) => item.id === assignment.positionId);
-    const compatible = Boolean(crew && currentPosition
-      && crew.readiness !== "Формується"
-      && (!crew.readiness || !currentPosition.readiness || crew.readiness === currentPosition.readiness));
-    updateAssignment(assignment.id, (current) => ({
-      ...current,
-      crewId,
-      positionId: compatible ? current.positionId : "",
-    }));
-  }
-
-  function chooseAssignmentPosition(assignment: RegistryAssignment, positionId: string) {
-    const crew = data.crews.find((item) => item.id === assignment.crewId);
-    const position = data.positions.find((item) => item.id === positionId);
-    if (!crew || !position) return;
-    if (crew.readiness === "Формується") {
-      setError("Екіпаж зі статусом «Формується» не може мати позицію.");
-      return;
-    }
-    if (crew.readiness && position.readiness && crew.readiness !== position.readiness) {
-      setError("Позицію не призначено: статус екіпажу має збігатися зі статусом позиції.");
-      return;
-    }
-    setData((current) => ({
-      ...current,
-      assignments: current.assignments.map((item) => item.id === assignment.id ? { ...item, positionId } : item),
-      crews: current.crews.map((item) => item.id === crew.id ? {
-        ...item,
-        strip: position.strip,
-        unit: position.unit,
-        uavType: position.uavType,
-      } : item),
-    }));
-  }
+  }, [mainTab, dataTab]);
 
   function changeZoom(direction: -1 | 1) {
     const current = TABLE_ZOOM_STEPS.findIndex((value) => value === tableZoom);
@@ -495,8 +691,69 @@ export default function StripsRegistryWorkspace() {
     setTableZoom(TABLE_ZOOM_STEPS[next]);
   }
 
-  function confirmDelete(value: PendingConfirmation) {
-    setPendingConfirmation(value);
+  function applyTableViewImmediately(search: string, filters: RegistryFilterState) {
+    tableViewGenerationRef.current += 1;
+    if (tableViewDebounceRef.current !== null) {
+      window.clearTimeout(tableViewDebounceRef.current);
+      tableViewDebounceRef.current = null;
+    }
+    setTableSearch(search);
+    setTableFilters(filters);
+    setAppliedTableSearch(search);
+    setAppliedTableFilters(filters);
+  }
+
+  function saveRecordEditor() {
+    if (!editor) return;
+    if (editor.kind === "crew") {
+      const crew = { ...editor.value, assets: editor.value.assets.split(",").map((item) => item.trim()).filter(Boolean).join(", ") };
+      const position = positionForCrew(data, crew.id);
+      const detached = Boolean(position && assignmentProblem(crew, position));
+      setData((current) => ({
+        ...current,
+        crews: editor.isNew ? [...current.crews, crew] : current.crews.map((item) => item.id === crew.id ? crew : item),
+        assignments: detached ? current.assignments.filter((item) => item.crewId !== crew.id) : current.assignments,
+      }));
+      if (detached) setNotice(`Екіпаж «${crew.name || "Без назви"}» відкріплено від несумісної позиції.`);
+    } else {
+      const position = { ...editor.value, area: upperUk(editor.value.area) };
+      const detachedIds = new Set(
+        data.assignments
+          .filter((assignment) => assignment.positionId === position.id)
+          .filter((assignment) => assignmentProblem(data.crews.find((crew) => crew.id === assignment.crewId) ?? null, position))
+          .map((assignment) => assignment.id),
+      );
+      setData((current) => ({
+        ...current,
+        positions: editor.isNew ? [...current.positions, position] : current.positions.map((item) => item.id === position.id ? position : item),
+        assignments: current.assignments.filter((item) => !detachedIds.has(item.id)),
+      }));
+      if (detachedIds.size > 0) setNotice(`Від позиції «${position.name || "Без назви"}» відкріплено несумісні екіпажі.`);
+    }
+    setEditor(null);
+  }
+
+  function saveAssignmentEditor() {
+    if (!assignmentEditor) return;
+    const crew = data.crews.find((item) => item.id === assignmentEditor.crewId) ?? null;
+    const position = data.positions.find((item) => item.id === assignmentEditor.positionId) ?? null;
+    const problem = assignmentProblem(crew, position);
+    if (problem) {
+      setError(problem);
+      return;
+    }
+    const duplicate = data.assignments.some((item) => item.id !== assignmentEditor.id && item.crewId === assignmentEditor.crewId);
+    if (duplicate) {
+      setError("Цей екіпаж уже має позицію.");
+      return;
+    }
+    setData((current) => {
+      if (assignmentEditor.id) {
+        return { ...current, assignments: current.assignments.map((item) => item.id === assignmentEditor.id ? { ...item, crewId: assignmentEditor.crewId, positionId: assignmentEditor.positionId } : item) };
+      }
+      return { ...current, assignments: [...current.assignments, { ...createRegistryAssignment(), crewId: assignmentEditor.crewId, positionId: assignmentEditor.positionId }] };
+    });
+    setAssignmentEditor(null);
   }
 
   function runConfirmation() {
@@ -520,7 +777,14 @@ export default function StripsRegistryWorkspace() {
     setError("");
     setDonePath("");
     try {
-      const saved = await invoke<string>("export_strips_workbook", { request: { ...report, outputPath } });
+      const saved = await invoke<string>("export_strips_workbook", {
+        request: {
+          ...report,
+          separateNotes: true,
+          hideUnlinkedSummaryCaption: true,
+          outputPath,
+        },
+      });
       setDonePath(saved);
     } catch (cause) {
       setError(messageFrom(cause));
@@ -529,179 +793,236 @@ export default function StripsRegistryWorkspace() {
     }
   }
 
-  const assignedCrewIds = new Set(data.assignments.map((assignment) => assignment.crewId).filter(Boolean));
+  async function importWorkbook() {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "Excel позицій по смугах", extensions: ["xlsx"] }],
+      title: "Імпортувати позиції та екіпажі",
+    });
+    if (!selected || Array.isArray(selected)) return;
+
+    setBusy(true);
+    setError("");
+    setDonePath("");
+    try {
+      const importedValue = await invoke<unknown>("import_strips_registry", { path: selected });
+      const parsedValue = typeof importedValue === "string" ? JSON.parse(importedValue) : importedValue;
+      const imported = normalizeStripsRegistry(parsedValue);
+      if (!imported) throw new Error("Excel-файл має некоректну структуру даних.");
+
+      const applyImport = () => {
+        setData(imported);
+        setMainTab("data");
+        setDataTab("general");
+        applyTableViewImmediately("", INITIAL_FILTERS);
+        setTableSorts(INITIAL_SORTS);
+        setNotice(`Імпортовано: ${imported.crews.length} екіпажів, ${imported.positions.length} позицій, ${imported.assignments.length} зв’язків.`);
+      };
+      if (isEffectivelyEmptyStripsRegistry(data)) {
+        applyImport();
+      } else {
+        setPendingConfirmation({
+          title: "Замінити поточні дані?",
+          label: `У файлі знайдено ${imported.crews.length} екіпажів, ${imported.positions.length} позицій і ${imported.assignments.length} зв’язків. Поточну чернетку буде замінено після підтвердження.`,
+          confirmLabel: "Імпортувати",
+          tone: "primary",
+          action: applyImport,
+        });
+      }
+    } catch (cause) {
+      setError(messageFrom(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const unassignedCrewCount = data.crews.filter((crew) => !data.assignments.some((item) => item.crewId === crew.id)).length;
+  const emptyPositionCount = data.positions.filter((position) => !data.assignments.some((item) => item.positionId === position.id)).length;
+  const activeSort = tableSorts[dataTab];
+  const activeSortOptions = (dataTab === "general"
+    ? GENERAL_SORT_OPTIONS
+    : dataTab === "crews"
+      ? CREW_SORT_OPTIONS
+      : POSITION_SORT_OPTIONS) as ReadonlyArray<CustomSelectOption<string>>;
+  const activeDefaultSortKey = dataTab === "general" ? "crew" : "name";
+  const activeShownCount = dataTab === "general"
+    ? visibleGeneralRows.length
+    : dataTab === "crews"
+      ? visibleCrews.length
+      : visiblePositions.length;
+  const activeTotalCount = dataTab === "general"
+    ? generalRows.length
+    : dataTab === "crews"
+      ? data.crews.length
+      : data.positions.length;
+
+  function changeActiveSortKey(key: string) {
+    setTableSorts((current) => {
+      if (dataTab === "general") return { ...current, general: { ...current.general, key: key as RegistryGeneralSortKey } };
+      if (dataTab === "crews") return { ...current, crews: { ...current.crews, key: key as RegistryCrewSortKey } };
+      return { ...current, positions: { ...current.positions, key: key as RegistryPositionSortKey } };
+    });
+  }
+
+  function toggleActiveSortDirection() {
+    setTableSorts((current) => {
+      if (dataTab === "general") return { ...current, general: { ...current.general, direction: current.general.direction === "asc" ? "desc" : "asc" } };
+      if (dataTab === "crews") return { ...current, crews: { ...current.crews, direction: current.crews.direction === "asc" ? "desc" : "asc" } };
+      return { ...current, positions: { ...current.positions, direction: current.positions.direction === "asc" ? "desc" : "asc" } };
+    });
+  }
+
+  function resetTableView() {
+    applyTableViewImmediately("", INITIAL_FILTERS);
+    setTableSorts(INITIAL_SORTS);
+  }
+
+  function changeDataTab(tab: DataTab) {
+    setDataTab(tab);
+    const options = collectRegistryTableFilterOptions(data, tab);
+    const filters = reconcileRegistryFilters(tableFilters, options, tab);
+    applyTableViewImmediately(tableSearch, filters);
+  }
 
   return (
-    <main className="app-shell strips-shell registry-shell">
+    <main className={`app-shell strips-shell registry-shell${modalOpen ? " registry-modal-open" : ""}`}>
       {error && <Notification kind="error">{error}</Notification>}
       {notice && <Notification kind="success">{notice}</Notification>}
       {donePath && <Notification kind="success">Файл збережено: {donePath}</Notification>}
-      {pendingReason && (
-        <ReasonModal
-          value={pendingReason.value}
-          onChange={(value) => setPendingReason((current) => current ? { ...current, value } : current)}
-          onCancel={() => setPendingReason(null)}
-          onSave={saveNotReadyReason}
-        />
-      )}
-      {pendingConfirmation && (
-        <ConfirmationModal value={pendingConfirmation} onCancel={() => setPendingConfirmation(null)} onConfirm={runConfirmation} />
-      )}
+      {editor && <RecordEditorModal editor={editor} data={data} onChange={setEditor} onCancel={() => setEditor(null)} onSave={saveRecordEditor} />}
+      {assignmentEditor && <AssignmentEditorModal value={assignmentEditor} data={data} onChange={setAssignmentEditor} onCancel={() => setAssignmentEditor(null)} onSave={saveAssignmentEditor} />}
+      {pendingConfirmation && <ConfirmationModal value={pendingConfirmation} onCancel={() => setPendingConfirmation(null)} onConfirm={runConfirmation} />}
 
       <section className="workspace-panel registry-panel">
         <div className="registry-toolbar">
-          <nav className="registry-tabs" aria-label="Розділи реєстру">
-            <button type="button" className={activeTab === "crews" ? "active" : ""} onClick={() => setActiveTab("crews")}>Екіпажі <span>{data.crews.length}</span></button>
-            <button type="button" className={activeTab === "positions" ? "active" : ""} onClick={() => setActiveTab("positions")}>Позиції <span>{data.positions.length}</span></button>
-            <button type="button" className={activeTab === "overview" ? "active" : ""} onClick={() => setActiveTab("overview")}>Загальна таблиця</button>
+          <nav className="registry-tabs registry-main-tabs" aria-label="Основні розділи">
+            <button type="button" className={mainTab === "data" ? "active" : ""} onClick={() => setMainTab("data")}>Дані</button>
+            <button type="button" className={mainTab === "report" ? "active" : ""} onClick={() => setMainTab("report")}>Загальна таблиця</button>
           </nav>
           <div className="registry-toolbar-controls">
+            {tauriAvailable && <button type="button" className="secondary-button registry-import-button" disabled={busy} onClick={importWorkbook}>
+              {busy ? <LoaderCircle className="spin" size={16} /> : <FileUp size={16} />} Імпорт XLSX
+            </button>}
             <label>Дата звіту<input type="date" value={data.reportDate} onChange={(event) => setData((current) => ({ ...current, reportDate: event.target.value }))} /></label>
-            <div className="bcs-zoom-control" aria-label="Масштаб таблиці">
+            {mainTab === "report" && <div className="bcs-zoom-control" aria-label="Масштаб таблиці">
               <span>Масштаб</span>
               <button type="button" aria-label="Зменшити масштаб" disabled={tableZoom === TABLE_ZOOM_STEPS[0]} onClick={() => changeZoom(-1)}><Minus size={15} /></button>
               <output>{tableZoom}%</output>
               <button type="button" aria-label="Збільшити масштаб" disabled={tableZoom === TABLE_ZOOM_STEPS[TABLE_ZOOM_STEPS.length - 1]} onClick={() => changeZoom(1)}><Plus size={15} /></button>
-            </div>
+            </div>}
           </div>
         </div>
 
+        {mainTab === "data" && <nav className="registry-subtabs" aria-label="Розділи даних">
+          <button type="button" className={dataTab === "general" ? "active" : ""} onClick={() => changeDataTab("general")}>Загальні <span>{generalRows.length}</span></button>
+          <button type="button" className={dataTab === "crews" ? "active" : ""} onClick={() => changeDataTab("crews")}>Екіпажі <span>{data.crews.length}</span></button>
+          <button type="button" className={dataTab === "positions" ? "active" : ""} onClick={() => changeDataTab("positions")}>Позиції <span>{data.positions.length}</span></button>
+        </nav>}
+
         <div ref={contentRef} className="registry-content-scroll">
-          <div className="registry-table-scale" style={{ "--registry-zoom": tableZoom / 100 } as CSSProperties}>
-            {activeTab === "crews" && (
-              <section className="registry-tab-content">
-                <div className="registry-section-heading">
-                  <div><h1>Реєстр екіпажів</h1><p>Один екіпаж — один запис. Дані позиції підтягуються автоматично зі зв’язку.</p></div>
-                  <button type="button" className="secondary-button" onClick={() => setData((current) => ({ ...current, crews: [...current.crews, createRegistryCrew()] }))}><Plus size={16} /> Додати екіпаж</button>
-                </div>
-                <table className="registry-data-table registry-crews-table">
-                  <thead><tr>
-                    <th>Назва екіпажу</th><th>Позиція</th><th>Смуга</th><th>БРО</th><th>Напрямок</th><th>Район</th>
-                    <th>Підрозділ</th><th>Тип БпЛА</th><th>БГ</th><th>БЧ</th><th>Засіб</th><th>Примітки</th><th></th>
-                  </tr></thead>
-                  <tbody>
-                    {data.crews.length === 0 && <tr><td colSpan={13} className="registry-empty-cell">Додайте перший екіпаж.</td></tr>}
-                    {data.crews.map((crew) => {
-                      const location = effectiveCrewLocation(data, crew);
-                      const linked = Boolean(location.position);
-                      return (
-                        <tr key={crew.id} className={statusClass(crew.readiness)}>
-                          <td><input value={crew.name} maxLength={250} onChange={(event) => updateCrew(crew.id, (current) => ({ ...current, name: event.target.value }))} /></td>
-                          <td><ReadonlyValue muted={!linked}>{location.position?.name || "Без позиції"}</ReadonlyValue></td>
-                          <td>{linked ? <ReadonlyValue>{location.strip}</ReadonlyValue> : <input value={crew.strip} maxLength={200} onChange={(event) => updateCrew(crew.id, (current) => ({ ...current, strip: event.target.value }))} />}</td>
-                          <td><ReadonlyValue muted={!linked}>{location.bro}</ReadonlyValue></td>
-                          <td><ReadonlyValue muted={!linked}>{location.direction}</ReadonlyValue></td>
-                          <td><ReadonlyValue muted={!linked}>{location.area}</ReadonlyValue></td>
-                          <td>{linked ? <ReadonlyValue>{location.unit}</ReadonlyValue> : <input value={crew.unit} maxLength={250} onChange={(event) => updateCrew(crew.id, (current) => ({ ...current, unit: event.target.value }))} />}</td>
-                          <td>{linked ? <ReadonlyValue>{location.uavType}</ReadonlyValue> : <CustomSelect<UavType> ariaLabel={`${crew.name || "Екіпаж"}: тип БпЛА`} value={crew.uavType} options={UAV_OPTIONS} onChange={(value) => updateCrew(crew.id, (current) => ({ ...current, uavType: value }))} />}</td>
-                          <td><CustomSelect<CrewReadiness> ariaLabel={`${crew.name || "Екіпаж"}: БГ`} value={crew.readiness} options={crewReadinessOptions(crew)} onChange={(value) => requestCrewReadiness(crew, value)} /></td>
-                          <td><CustomSelect<CrewDuty> ariaLabel={`${crew.name || "Екіпаж"}: БЧ`} value={crew.duty} options={DUTY_OPTIONS} disabled={crew.readiness === "Формується"} onChange={(value) => updateCrew(crew.id, (current) => ({ ...current, duty: value }))} /></td>
-                          <td><textarea value={crew.assets} maxLength={500} rows={2} onBlur={(event) => updateCrew(crew.id, (current) => ({ ...current, assets: event.target.value.split(",").map((item) => item.trim()).filter(Boolean).join(", ") }))} onChange={(event) => updateCrew(crew.id, (current) => ({ ...current, assets: event.target.value }))} /></td>
-                          <td><textarea value={crew.note} maxLength={1000} rows={2} onChange={(event) => updateCrew(crew.id, (current) => ({ ...current, note: event.target.value }))} /></td>
-                          <td className="registry-actions-cell"><button type="button" className="registry-icon-button danger" aria-label="Видалити екіпаж" onClick={() => confirmDelete({ title: "Видалити екіпаж?", label: `Екіпаж «${crew.name || "Без назви"}» і його зв’язок із позицією буде видалено.`, action: () => setData((current) => ({ ...current, crews: current.crews.filter((item) => item.id !== crew.id), assignments: current.assignments.filter((item) => item.crewId !== crew.id) })) })}><Trash2 size={16} /></button></td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </section>
-            )}
+          {mainTab === "data" && <section className="registry-data-content">
+            <RegistryTableControls
+              tab={dataTab}
+              search={tableSearch}
+              filters={tableFilters}
+              filterOptions={tableFilterOptions}
+              sortKey={activeSort.key}
+              defaultSortKey={activeDefaultSortKey}
+              sortDirection={activeSort.direction}
+              sortOptions={activeSortOptions}
+              onSearch={setTableSearch}
+              onFilters={setTableFilters}
+              onSortKey={changeActiveSortKey}
+              onSortDirection={toggleActiveSortDirection}
+              onReset={resetTableView}
+            />
+            {dataTab === "general" && <>
+              <div className="registry-section-heading">
+                <div><h1>Загальні дані</h1><p>Тут екіпажі та позиції поєднуються. Самі записи залишаються окремими.</p></div>
+                <button type="button" className="secondary-button" disabled={unassignedCrewCount === 0 || data.positions.length === 0} onClick={() => setAssignmentEditor({ id: null, crewId: "", positionId: "" })}><Link2 size={16} /> Пов’язати екіпаж і позицію</button>
+              </div>
+              <div className="registry-overview-cards">
+                <span><b>{data.crews.length}</b> екіпажів</span><span><b>{data.positions.length}</b> позицій</span>
+                <span><b>{unassignedCrewCount}</b> без позиції</span><span><b>{emptyPositionCount}</b> без екіпажу</span>
+              </div>
+              <div className="registry-ledger-wrap"><table className="registry-records-table registry-general-table">
+                <thead><tr><th>№</th><th>Екіпаж</th><th>Позиція</th><th>Смуга</th><th>Підрозділ</th><th>Тип БпЛА</th><th>БГ екіпажу</th><th>БЧ</th><th>Засіб</th><th>БГ позиції</th><th>БРО</th><th>Район</th><th>Напрямок</th><th>Примітки</th><th>Дії</th></tr></thead>
+                <tbody>
+                  {visibleGeneralRows.length === 0 && <tr><td colSpan={15} className="registry-empty-cell">{generalRows.length === 0 ? "Спочатку додайте екіпажі та позиції у відповідних вкладках." : "За заданими умовами нічого не знайдено."}</td></tr>}
+                  {visibleGeneralRows.map((row, index) => <tr key={row.key}>
+                    <td>{index + 1}</td>
+                    <td><LedgerValue muted={!row.crew}>{row.crew?.name || "Позиція без екіпажу"}</LedgerValue></td>
+                    <td><LedgerValue muted={!row.position}>{row.position?.name || "Екіпаж без позиції"}</LedgerValue></td>
+                    <td><LedgerValue>{row.position?.strip}</LedgerValue></td>
+                    <td><LedgerValue>{row.crew?.unit || row.position?.unit}</LedgerValue></td>
+                    <td><LedgerValue>{row.crew?.uavType || row.position?.uavType}</LedgerValue></td>
+                    <td>{row.crew ? <StatusBadge value={row.crew.readiness} reason={row.crew.notReadyReason} /> : "—"}</td>
+                    <td><LedgerValue>{row.crew?.duty}</LedgerValue></td>
+                    <td><LedgerValue>{row.crew?.assets}</LedgerValue></td>
+                    <td>{row.position ? <StatusBadge value={row.position.readiness} reason={row.position.notReadyReason} /> : "—"}</td>
+                    <td><LedgerValue>{row.position?.bro}</LedgerValue></td><td><LedgerValue>{row.position?.area}</LedgerValue></td><td><LedgerValue>{row.position?.direction}</LedgerValue></td>
+                    <td><LedgerValue>{registryGeneralRowNote(row)}</LedgerValue></td>
+                    <td className="registry-actions-cell">
+                      <div className="registry-action-buttons">
+                        <button type="button" className="registry-icon-button" title={row.assignment ? "Змінити зв’язок" : "Призначити"} aria-label={row.assignment ? "Змінити зв’язок" : "Призначити"} disabled={data.positions.length === 0 || (!row.crew && unassignedCrewCount === 0)} onClick={() => setAssignmentEditor({ id: row.assignment?.id ?? null, crewId: row.crew?.id ?? "", positionId: row.position?.id ?? "" })}>{row.assignment ? <Pencil size={16} /> : <Link2 size={16} />}</button>
+                        {row.assignment && <button type="button" className="registry-icon-button danger" title="Відкріпити" aria-label="Відкріпити" onClick={() => setData((current) => ({ ...current, assignments: current.assignments.filter((item) => item.id !== row.assignment?.id) }))}><Unlink2 size={16} /></button>}
+                      </div>
+                    </td>
+                  </tr>)}
+                </tbody>
+              </table></div>
+            </>}
 
-            {activeTab === "positions" && (
-              <section className="registry-tab-content">
-                <div className="registry-section-heading">
-                  <div><h1>Реєстр позицій</h1><p>Поля позиції є спільними для всіх прикріплених до неї екіпажів.</p></div>
-                  <button type="button" className="secondary-button" onClick={() => setData((current) => ({ ...current, positions: [...current.positions, createRegistryPosition()] }))}><Plus size={16} /> Додати позицію</button>
-                </div>
-                <table className="registry-data-table registry-positions-table">
-                  <thead><tr>
-                    <th>Назва позиції</th><th>Смуга</th><th>Підрозділ</th><th>Тип БпЛА</th><th>БГ позиції</th>
-                    <th>БРО</th><th>Район</th><th>Напрямок роботи</th><th>Екіпажі</th><th>Примітки</th><th></th>
-                  </tr></thead>
-                  <tbody>
-                    {data.positions.length === 0 && <tr><td colSpan={11} className="registry-empty-cell">Додайте першу позицію.</td></tr>}
-                    {data.positions.map((position) => {
-                      const linkedCrews = data.assignments
-                        .filter((assignment) => assignment.positionId === position.id)
-                        .map((assignment) => data.crews.find((crew) => crew.id === assignment.crewId)?.name)
-                        .filter(Boolean) as string[];
-                      return (
-                        <tr key={position.id} className={statusClass(position.readiness)}>
-                          <td><input value={position.name} maxLength={250} onChange={(event) => updatePosition(position.id, (current) => ({ ...current, name: event.target.value }))} /></td>
-                          <td><input value={position.strip} maxLength={200} onChange={(event) => updatePosition(position.id, (current) => ({ ...current, strip: event.target.value }))} /></td>
-                          <td><input value={position.unit} maxLength={250} onChange={(event) => updatePosition(position.id, (current) => ({ ...current, unit: event.target.value }))} /></td>
-                          <td><CustomSelect<UavType> ariaLabel={`${position.name || "Позиція"}: тип БпЛА`} value={position.uavType} options={UAV_OPTIONS} onChange={(value) => updatePosition(position.id, (current) => ({ ...current, uavType: value }))} /></td>
-                          <td><CustomSelect<PositionReadiness> ariaLabel={`${position.name || "Позиція"}: БГ`} value={position.readiness} options={positionReadinessOptions(position)} onChange={(value) => requestPositionReadiness(position, value)} /></td>
-                          <td><input value={position.bro} maxLength={250} onChange={(event) => updatePosition(position.id, (current) => ({ ...current, bro: event.target.value }))} /></td>
-                          <td><input value={position.area} maxLength={250} onChange={(event) => updatePosition(position.id, (current) => ({ ...current, area: upperUk(event.target.value) }))} /></td>
-                          <td><textarea value={position.direction} maxLength={500} rows={2} onChange={(event) => updatePosition(position.id, (current) => ({ ...current, direction: event.target.value }))} /></td>
-                          <td><ReadonlyValue muted={linkedCrews.length === 0}>{linkedCrews.join(", ") || "Без екіпажу"}</ReadonlyValue></td>
-                          <td><textarea value={position.note} maxLength={1000} rows={2} onChange={(event) => updatePosition(position.id, (current) => ({ ...current, note: event.target.value }))} /></td>
-                          <td className="registry-actions-cell"><button type="button" className="registry-icon-button danger" aria-label="Видалити позицію" onClick={() => confirmDelete({ title: "Видалити позицію?", label: `Позиція «${position.name || "Без назви"}» буде видалена. Екіпажі залишаться у реєстрі без позиції.`, action: () => setData((current) => ({ ...current, positions: current.positions.filter((item) => item.id !== position.id), assignments: current.assignments.filter((item) => item.positionId !== position.id) })) })}><Trash2 size={16} /></button></td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </section>
-            )}
+            {dataTab === "crews" && <>
+              <div className="registry-section-heading">
+                <div><h1>Екіпажі</h1><p>Лише дані екіпажів. Позиція, смуга, БРО, район і напрямок тут не зберігаються.</p></div>
+                <button type="button" className="secondary-button" onClick={() => setEditor({ kind: "crew", isNew: true, value: createRegistryCrew() })}><Plus size={16} /> Додати екіпаж</button>
+              </div>
+              <div className="registry-ledger-wrap"><table className="registry-records-table registry-crews-ledger">
+                <thead><tr><th>№</th><th>Назва екіпажу</th><th>Підрозділ</th><th>Тип БпЛА</th><th>БГ</th><th>БЧ</th><th>Засіб</th><th>Примітки</th><th>Дії</th></tr></thead>
+                <tbody>
+                  {visibleCrews.length === 0 && <tr><td colSpan={9} className="registry-empty-cell">{data.crews.length === 0 ? "Додайте перший екіпаж." : "За заданими умовами нічого не знайдено."}</td></tr>}
+                  {visibleCrews.map((crew, index) => <tr key={crew.id}>
+                    <td>{index + 1}</td><td><LedgerValue>{crew.name}</LedgerValue></td><td><LedgerValue>{crew.unit}</LedgerValue></td><td><LedgerValue>{crew.uavType}</LedgerValue></td>
+                    <td><StatusBadge value={crew.readiness} reason={crew.notReadyReason} /></td><td><LedgerValue>{crew.duty}</LedgerValue></td><td><LedgerValue>{crew.assets}</LedgerValue></td><td><LedgerValue>{crew.note}</LedgerValue></td>
+                    <td className="registry-actions-cell"><div className="registry-action-buttons">
+                      <button type="button" className="registry-icon-button" title="Редагувати екіпаж" aria-label="Редагувати екіпаж" onClick={() => setEditor({ kind: "crew", isNew: false, value: { ...crew } })}><Pencil size={16} /></button>
+                      <button type="button" className="registry-icon-button danger" title="Видалити екіпаж" aria-label="Видалити екіпаж" onClick={() => setPendingConfirmation({ title: "Видалити екіпаж?", label: `Екіпаж «${crew.name || "Без назви"}» і його зв’язок із позицією буде видалено.`, action: () => setData((current) => ({ ...current, crews: current.crews.filter((item) => item.id !== crew.id), assignments: current.assignments.filter((item) => item.crewId !== crew.id) })) })}><Trash2 size={16} /></button>
+                    </div></td>
+                  </tr>)}
+                </tbody>
+              </table></div>
+            </>}
 
-            {activeTab === "overview" && (
-              <section className="registry-tab-content registry-overview-content">
-                <div className="registry-section-heading">
-                  <div><h1>Розподіл екіпажів по позиціях</h1><p>Оберіть існуючий екіпаж і позицію. Один екіпаж можна використати лише один раз; одна позиція може мати кілька екіпажів.</p></div>
-                  <button type="button" className="secondary-button" disabled={assignedCrewIds.size >= data.crews.length || data.positions.length === 0} onClick={() => setData((current) => ({ ...current, assignments: [...current.assignments, createRegistryAssignment()] }))}><Link2 size={16} /> Додати зв’язок</button>
-                </div>
-                <table className="registry-data-table registry-assignment-table">
-                  <thead><tr><th>Екіпаж</th><th>Позиція</th><th>Смуга</th><th>Підрозділ</th><th>Тип БпЛА</th><th>Статус</th><th></th></tr></thead>
-                  <tbody>
-                    {data.assignments.length === 0 && <tr><td colSpan={7} className="registry-empty-cell">Зв’язків ще немає. Екіпажі без зв’язку автоматично потраплять у таблицю як «Екіпаж без позиції».</td></tr>}
-                    {data.assignments.map((assignment) => {
-                      const crew = data.crews.find((item) => item.id === assignment.crewId);
-                      const position = data.positions.find((item) => item.id === assignment.positionId);
-                      const crewOptions: ReadonlyArray<CustomSelectOption<string>> = data.crews.map((item) => ({
-                        value: item.id,
-                        label: `${item.name || "Без назви"} — ${item.unit || "підрозділ не вказано"}`,
-                        disabled: item.id !== assignment.crewId && assignedCrewIds.has(item.id),
-                      }));
-                      const positionOptions: ReadonlyArray<CustomSelectOption<string>> = data.positions.map((item) => ({
-                        value: item.id,
-                        label: `${item.name || "Без назви"} — ${item.strip || "смуга не вказана"} — ${item.unit || "підрозділ не вказано"}`,
-                        disabled: Boolean(crew && (
-                          crew.readiness === "Формується"
-                          || (crew.readiness && item.readiness && crew.readiness !== item.readiness)
-                        )),
-                      }));
-                      return (
-                        <tr key={assignment.id} className={statusClass(crew?.readiness || position?.readiness || "")}>
-                          <td><CustomSelect<string> ariaLabel="Оберіть екіпаж" value={assignment.crewId} options={crewOptions} onChange={(value) => chooseAssignmentCrew(assignment, value)} /></td>
-                          <td><CustomSelect<string> ariaLabel="Оберіть позицію" value={assignment.positionId} options={positionOptions} disabled={!crew} onChange={(value) => chooseAssignmentPosition(assignment, value)} /></td>
-                          <td><ReadonlyValue>{position?.strip}</ReadonlyValue></td>
-                          <td><ReadonlyValue>{position?.unit}</ReadonlyValue></td>
-                          <td><ReadonlyValue>{position?.uavType}</ReadonlyValue></td>
-                          <td><ReadonlyValue>{crew && position ? `${readinessDisplay(crew.readiness, crew.notReadyReason)} / ${readinessDisplay(position.readiness, position.notReadyReason)}` : "Не завершено"}</ReadonlyValue></td>
-                          <td className="registry-actions-cell"><button type="button" className="registry-icon-button danger" aria-label="Прибрати зв’язок" onClick={() => setData((current) => ({ ...current, assignments: current.assignments.filter((item) => item.id !== assignment.id) }))}><Unlink2 size={16} /></button></td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+            {dataTab === "positions" && <>
+              <div className="registry-section-heading">
+                <div><h1>Позиції</h1><p>Лише дані позицій. Екіпажі приєднуються окремо у вкладці «Загальні».</p></div>
+                <button type="button" className="secondary-button" onClick={() => setEditor({ kind: "position", isNew: true, value: createRegistryPosition() })}><Plus size={16} /> Додати позицію</button>
+              </div>
+              <div className="registry-ledger-wrap"><table className="registry-records-table registry-positions-ledger">
+                <thead><tr><th>№</th><th>Назва позиції</th><th>Смуга</th><th>Підрозділ</th><th>Тип БпЛА</th><th>БГ</th><th>БРО</th><th>Район</th><th>Напрямок роботи</th><th>Примітки</th><th>Дії</th></tr></thead>
+                <tbody>
+                  {visiblePositions.length === 0 && <tr><td colSpan={11} className="registry-empty-cell">{data.positions.length === 0 ? "Додайте першу позицію." : "За заданими умовами нічого не знайдено."}</td></tr>}
+                  {visiblePositions.map((position, index) => <tr key={position.id}>
+                    <td>{index + 1}</td><td><LedgerValue>{position.name}</LedgerValue></td><td><LedgerValue>{position.strip}</LedgerValue></td><td><LedgerValue>{position.unit}</LedgerValue></td><td><LedgerValue>{position.uavType}</LedgerValue></td>
+                    <td><StatusBadge value={position.readiness} reason={position.notReadyReason} /></td><td><LedgerValue>{position.bro}</LedgerValue></td><td><LedgerValue>{position.area}</LedgerValue></td><td><LedgerValue>{position.direction}</LedgerValue></td><td><LedgerValue>{position.note}</LedgerValue></td>
+                    <td className="registry-actions-cell"><div className="registry-action-buttons">
+                      <button type="button" className="registry-icon-button" title="Редагувати позицію" aria-label="Редагувати позицію" onClick={() => setEditor({ kind: "position", isNew: false, value: { ...position } })}><Pencil size={16} /></button>
+                      <button type="button" className="registry-icon-button danger" title="Видалити позицію" aria-label="Видалити позицію" onClick={() => setPendingConfirmation({ title: "Видалити позицію?", label: `Позиція «${position.name || "Без назви"}» буде видалена. Екіпажі залишаться без позиції.`, action: () => setData((current) => ({ ...current, positions: current.positions.filter((item) => item.id !== position.id), assignments: current.assignments.filter((item) => item.positionId !== position.id) })) })}><Trash2 size={16} /></button>
+                    </div></td>
+                  </tr>)}
+                </tbody>
+              </table></div>
+            </>}
+            <div className="registry-table-status">
+              <output className="registry-view-count" aria-live="polite">Показано {activeShownCount} з {activeTotalCount}</output>
+            </div>
+          </section>}
 
-                <div className="registry-generated-heading">
-                  <div><h2>Сформована таблиця</h2><p>Цю частину не можна редагувати. Вона змінюється лише через реєстри та розподіл вище.</p></div>
-                  <div className="registry-summary-chips">
-                    <span>Екіпажів: <b>{summary.crewTotals.total}</b></span>
-                    <span>БГ: <b>{summary.crewTotals.ready}</b></span>
-                    <span>Не БГ: <b>{summary.crewTotals.notReady}</b></span>
-                    <span>Позицій: <b>{summary.positionTotals.total}</b></span>
-                    <span>Без позиції: <b>{summary.crewsWithoutPosition}</b></span>
-                    <span>Без екіпажу: <b>{summary.positionsWithoutCrews}</b></span>
-                  </div>
-                </div>
-                <PreviewTable report={report} />
-              </section>
-            )}
-          </div>
+          {mainTab === "report" && <section className="registry-report-content">
+            <StripsReportView report={report} zoom={tableZoom} />
+          </section>}
         </div>
       </section>
 

@@ -20,7 +20,6 @@ import {
 export interface RegistryCrew {
   id: string;
   name: string;
-  strip: string;
   unit: string;
   uavType: UavType | "";
   readiness: CrewReadiness | "";
@@ -51,7 +50,7 @@ export interface RegistryAssignment {
 }
 
 export interface StripsRegistryData {
-  version: 1;
+  version: 2;
   reportDate: string;
   crews: RegistryCrew[];
   positions: RegistryPosition[];
@@ -68,6 +67,8 @@ export interface EffectiveCrewLocation {
   direction: string;
 }
 
+export const UNASSIGNED_STRIP_NAME = "Екіпажі без позиції";
+
 let nextRegistryId = 1;
 
 function registryId(prefix: string): string {
@@ -78,7 +79,6 @@ export function createRegistryCrew(): RegistryCrew {
   return {
     id: registryId("registry-crew"),
     name: "",
-    strip: "",
     unit: "",
     uavType: "",
     readiness: "",
@@ -114,7 +114,155 @@ export function createRegistryAssignment(): RegistryAssignment {
 }
 
 export function createEmptyStripsRegistry(reportDate: string): StripsRegistryData {
-  return { version: 1, reportDate, crews: [], positions: [], assignments: [] };
+  return { version: 2, reportDate, crews: [], positions: [], assignments: [] };
+}
+
+/**
+ * An empty draft from an older registry build may contain the single blank
+ * crew row that used to be created up front. Treat that row as scaffolding,
+ * but never replace a draft once the user has entered any registry value.
+ */
+export function isEffectivelyEmptyStripsRegistry(data: StripsRegistryData): boolean {
+  if (data.positions.length > 0 || data.assignments.length > 0) return false;
+  return data.crews.every((crew) => [
+    crew.name,
+    crew.unit,
+    crew.uavType,
+    crew.readiness,
+    crew.notReadyReason,
+    crew.duty,
+    crew.assets,
+    crew.note,
+  ].every((value) => value.trim().length === 0));
+}
+
+/**
+ * A complete QA/starter fixture. The caller may expose it for an explicit
+ * development preview or seed it once when the encrypted registry draft is
+ * effectively empty; meaningful saved data must always win.
+ */
+export function createDemoStripsRegistry(reportDate: string): StripsRegistryData {
+  const data = createEmptyStripsRegistry(reportDate);
+  const crewCounts = [2, 2, 2, 1, 1, 0] as const;
+  const readiness: ReadonlyArray<PositionReadiness> = ["БГ", "БГ", "Не БГ", "Не БГ", "БГ", "БГ"];
+  const reasons = ["", "", "Несправність основного засобу", "Екіпаж виведено з позиції", "", ""] as const;
+  const assets: Record<UavType, string> = {
+    "ФПВ": "FPV 10, FPV 13",
+    "ФПВ Перехоплювач": "FPV-перехоплювач",
+    "Коптер": "Mavic 3T, Autel EVO II",
+    "Бомбер": "Vampire",
+    "Літаковий Розвідувальний": "Лелека-100",
+    "Літаковий Ударний": "RAM II",
+    "НРК": "НРК",
+  };
+  const plans: ReadonlyArray<{
+    slug: string;
+    strip: string;
+    area: string;
+    direction: string;
+    slots: ReadonlyArray<readonly [string, string, UavType]>;
+  }> = [
+    {
+      slug: "north", strip: "Смуга ПІВНІЧ", area: "ПІВНІЧНИЙ РАЙОН", direction: "Північний напрямок",
+      slots: [
+        ["СОКІЛ", "1 РУБАК", "ФПВ"], ["ВОВК", "2 РУБАК", "ФПВ"],
+        ["ГРІМ", "3 РУБАК", "Бомбер"], ["ХОРТ", "4 РУБАК", "Бомбер"],
+        ["ОРЛАН", "1 РУБАК", "Літаковий Розвідувальний"], ["БАСТІОН", "2 РУБАК", "Літаковий Розвідувальний"],
+      ],
+    },
+    {
+      slug: "east", strip: "Смуга СХІД", area: "СХІДНИЙ РАЙОН", direction: "Східний напрямок",
+      slots: [
+        ["РУБІН", "1 РУБАК", "Коптер"], ["ТІНЬ", "2 РУБАК", "Коптер"],
+        ["СТРІЛА", "3 РУБАК", "ФПВ Перехоплювач"], ["БАРС", "4 РУБАК", "ФПВ Перехоплювач"],
+        ["ФАНТОМ", "1 РУБАК", "Літаковий Ударний"], ["МАЯК", "2 РУБАК", "Літаковий Ударний"],
+      ],
+    },
+    {
+      slug: "south", strip: "Смуга ПІВДЕНЬ", area: "ПІВДЕННИЙ РАЙОН", direction: "Південний напрямок",
+      slots: [
+        ["БУРЯ", "3 РУБАК", "ФПВ"], ["СКЕЛЯ", "4 РУБАК", "ФПВ"],
+        ["МОЛОТ", "Саперний взвод", "НРК"], ["ТИТАН", "Рота НРК", "НРК"],
+        ["ВАМПІР", "1 РУБАК", "Бомбер"], ["ГРОМ", "2 РУБАК", "Бомбер"],
+      ],
+    },
+    {
+      slug: "west", strip: "Смуга ЗАХІД", area: "ЗАХІДНИЙ РАЙОН", direction: "Західний напрямок",
+      slots: [
+        ["КРИЛО", "3 РУБАК", "Літаковий Розвідувальний"], ["ДОЗОР", "4 РУБАК", "Літаковий Розвідувальний"],
+        ["МАВІК", "1 РУБАК", "Коптер"], ["ОБРІЙ", "2 РУБАК", "Коптер"],
+        ["ШЕРШЕНЬ", "3 РУБАК", "Літаковий Ударний"], ["ФУРІЯ", "4 РУБАК", "Літаковий Ударний"],
+      ],
+    },
+  ];
+
+  plans.forEach((plan, stripIndex) => {
+    plan.slots.forEach(([code, unit, uavType], positionIndex) => {
+      const positionId = `demo-position-${plan.slug}-${positionIndex + 1}`;
+      const positionReadiness = readiness[positionIndex];
+      const reason = reasons[positionIndex];
+      data.positions.push({
+        ...createRegistryPosition(),
+        id: positionId,
+        name: `ПОЗИЦІЯ ${code}`,
+        strip: plan.strip,
+        unit,
+        uavType,
+        readiness: positionReadiness,
+        notReadyReason: reason,
+        bro: `БРО-${stripIndex + 1}.${positionIndex + 1}`,
+        area: plan.area,
+        direction: plan.direction,
+        note: positionIndex === 0 ? "Основна позиція. Чергування у дві зміни." : "",
+      });
+      for (let crewIndex = 0; crewIndex < crewCounts[positionIndex]; crewIndex += 1) {
+        const crewId = `demo-crew-${plan.slug}-${positionIndex + 1}-${crewIndex + 1}`;
+        data.crews.push({
+          ...createRegistryCrew(),
+          id: crewId,
+          name: `${code}-${crewIndex + 1}`,
+          unit,
+          uavType,
+          readiness: positionReadiness,
+          notReadyReason: reason,
+          duty: crewIndex % 2 === 0 ? "БЧ" : "Відпочинок після БЧ",
+          assets: assets[uavType],
+          note: crewIndex === 1 ? "Резервна зміна" : "",
+        });
+        data.assignments.push({
+          ...createRegistryAssignment(),
+          id: `demo-assignment-${plan.slug}-${positionIndex + 1}-${crewIndex + 1}`,
+          crewId,
+          positionId,
+        });
+      }
+    });
+  });
+
+  ["ПІВНІЧ", "СХІД", "ПІВДЕНЬ", "ЗАХІД"].forEach((label, index) => data.crews.push({
+    ...createRegistryCrew(),
+    id: `demo-forming-${index + 1}`,
+    name: `РЕЗЕРВ-${label}`,
+    unit: `${index + 1} РУБАК`,
+    uavType: "ФПВ Перехоплювач",
+    readiness: "Формується",
+    duty: "Формується",
+    assets: "Комплект формується",
+    note: "Комплектування особового складу",
+  }));
+  ["Саперний взвод", "1 РУБАК", "2 РУБАК", "3 РУБАК"].forEach((unit, index) => data.crews.push({
+    ...createRegistryCrew(),
+    id: `demo-loose-${index + 1}`,
+    name: `МАНЕВР-${index + 1}`,
+    unit,
+    uavType: "НРК",
+    readiness: "БГ",
+    duty: index % 2 === 0 ? "БЧ" : "Відпочинок після БЧ",
+    assets: "НРК",
+    note: "Очікує призначення на позицію",
+  }));
+
+  return data;
 }
 
 function normalizedLabel(value: string): string {
@@ -156,15 +304,15 @@ export function effectiveCrewLocation(
     ? {
         position,
         strip: position.strip,
-        unit: position.unit,
-        uavType: position.uavType,
+        unit: crew.unit,
+        uavType: crew.uavType,
         bro: position.bro,
         area: position.area,
         direction: position.direction,
       }
     : {
         position: null,
-        strip: crew.strip,
+        strip: UNASSIGNED_STRIP_NAME,
         unit: crew.unit,
         uavType: crew.uavType,
         bro: "",
@@ -198,7 +346,6 @@ export function validateStripsRegistry(data: StripsRegistryData): string[] {
       if (previous) problems.push(`${label}: назва «${crew.name.trim()}» уже використана в «${previous}».`);
       else crewNames.set(key, label);
     }
-    if (missing(crew.strip)) problems.push(`${label}: вкажіть смугу.`);
     if (missing(crew.unit)) problems.push(`${label}: вкажіть підрозділ.`);
     if (!crew.uavType) problems.push(`${label}: оберіть тип БпЛА.`);
     if (!crew.readiness) problems.push(`${label}: оберіть БГ екіпажу.`);
@@ -250,6 +397,12 @@ export function validateStripsRegistry(data: StripsRegistryData): string[] {
     }
     if (crew?.readiness && position?.readiness && crew.readiness !== position.readiness) {
       problems.push(`${label}: статус екіпажу має збігатися зі статусом позиції.`);
+    }
+    if (crew?.unit && position?.unit && normalizedLabel(crew.unit) !== normalizedLabel(position.unit)) {
+      problems.push(`${label}: підрозділ екіпажу має збігатися з підрозділом позиції.`);
+    }
+    if (crew?.uavType && position?.uavType && crew.uavType !== position.uavType) {
+      problems.push(`${label}: тип БпЛА екіпажу має збігатися з типом БпЛА позиції.`);
     }
   });
 
@@ -327,7 +480,7 @@ export function registryToStripsReport(data: StripsRegistryData): StripsReport {
 
   data.crews.forEach((crew) => {
     if (linkedCrewIds.has(crew.id)) return;
-    builderFor(crew.strip, crew.unit, crew.uavType).looseCrews.push(toStripCrew(crew, true));
+    builderFor(UNASSIGNED_STRIP_NAME, crew.unit, crew.uavType).looseCrews.push(toStripCrew(crew, true));
   });
 
   const stripNames: string[] = [];
@@ -370,8 +523,15 @@ function stringValue(value: unknown): string {
 
 export function normalizeStripsRegistry(value: unknown): StripsRegistryData | null {
   if (!value || typeof value !== "object") return null;
-  const candidate = value as Partial<StripsRegistryData>;
-  if (candidate.version !== 1
+  const candidate = value as {
+    version?: unknown;
+    reportDate?: unknown;
+    crews?: unknown;
+    positions?: unknown;
+    assignments?: unknown;
+  };
+  const sourceVersion = candidate.version;
+  if ((sourceVersion !== 1 && sourceVersion !== 2)
     || typeof candidate.reportDate !== "string"
     || !Array.isArray(candidate.crews)
     || !Array.isArray(candidate.positions)
@@ -380,7 +540,7 @@ export function normalizeStripsRegistry(value: unknown): StripsRegistryData | nu
   const uavTypes = new Set<string>(UAV_TYPES);
   const crews: RegistryCrew[] = [];
   const positions: RegistryPosition[] = [];
-  const assignments: RegistryAssignment[] = [];
+  const rawAssignments: RegistryAssignment[] = [];
 
   for (const raw of candidate.crews) {
     if (!raw || typeof raw !== "object") return null;
@@ -392,7 +552,6 @@ export function normalizeStripsRegistry(value: unknown): StripsRegistryData | nu
     crews.push({
       id: crew.id,
       name: stringValue(crew.name),
-      strip: stringValue(crew.strip),
       unit: stringValue(crew.unit),
       uavType: typeof crew.uavType === "string" && uavTypes.has(crew.uavType)
         ? crew.uavType as UavType
@@ -437,12 +596,44 @@ export function normalizeStripsRegistry(value: unknown): StripsRegistryData | nu
     if (!raw || typeof raw !== "object") return null;
     const assignment = raw as Partial<RegistryAssignment>;
     if (typeof assignment.id !== "string" || !assignment.id) return null;
-    assignments.push({
+    rawAssignments.push({
       id: assignment.id,
       crewId: stringValue(assignment.crewId),
       positionId: stringValue(assignment.positionId),
     });
   }
 
-  return { version: 1, reportDate: candidate.reportDate, crews, positions, assignments };
+  // Older versions could autosave an empty link row before the user selected
+  // both records. Do not carry invisible, dangling or duplicate links into the
+  // registry: the current UI derives its rows from crews and positions, so such
+  // links could otherwise block export without giving the user anything to fix.
+  const validCrewIds = new Set(crews.map((crew) => crew.id));
+  const validPositionIds = new Set(positions.map((position) => position.id));
+  const seenAssignmentIds = new Set<string>();
+  const assignedCrewIds = new Set<string>();
+  const assignments = rawAssignments.filter((assignment) => {
+    if (!validCrewIds.has(assignment.crewId) || !validPositionIds.has(assignment.positionId)) return false;
+    if (seenAssignmentIds.has(assignment.id) || assignedCrewIds.has(assignment.crewId)) return false;
+    seenAssignmentIds.add(assignment.id);
+    assignedCrewIds.add(assignment.crewId);
+    return true;
+  });
+
+  if (sourceVersion === 1) {
+    const positionsById = new Map(positions.map((position) => [position.id, position]));
+    const positionByCrewId = new Map(
+      assignments.map((assignment) => [assignment.crewId, positionsById.get(assignment.positionId)]),
+    );
+    crews.forEach((crew) => {
+      const position = positionByCrewId.get(crew.id);
+      if (!position) return;
+      // v1 treated these values as position-owned and copied them into crews.
+      // Preserve the effective result once while migrating, then keep both
+      // records independent in v2.
+      crew.unit = position.unit;
+      crew.uavType = position.uavType;
+    });
+  }
+
+  return { version: 2, reportDate: candidate.reportDate, crews, positions, assignments };
 }

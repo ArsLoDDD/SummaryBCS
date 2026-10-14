@@ -70,6 +70,19 @@ export interface ExceptionSummaryRow {
   positionsWithoutCrews: number;
 }
 
+export interface CountMatrixRow {
+  label: string;
+  values: number[];
+  total: number;
+}
+
+export interface CountMatrix {
+  columns: string[];
+  rows: CountMatrixRow[];
+  columnTotals: number[];
+  total: number;
+}
+
 export interface StripsSummary {
   crews: UavSummaryRow[];
   positions: UavSummaryRow[];
@@ -78,6 +91,9 @@ export interface StripsSummary {
   exceptions: ExceptionSummaryRow[];
   crewsWithoutPosition: number;
   positionsWithoutCrews: number;
+  crewsByUnitAndStrip: CountMatrix;
+  crewsByUnitAndUavType: CountMatrix;
+  crewsByStripAndUavType: CountMatrix;
 }
 
 let nextId = 1;
@@ -684,6 +700,60 @@ function addStatus(counts: StatusCounts, status: string) {
   else if (status === "Формується") counts.forming += 1;
 }
 
+interface LinkedCrewFact {
+  strip: string;
+  unit: string;
+  uavType: UavType;
+}
+
+function orderedLabels(values: string[]): Array<{ key: string; label: string }> {
+  const labels: Array<{ key: string; label: string }> = [];
+  const seen = new Set<string>();
+  values.forEach((value) => {
+    const key = normalizedLabel(value);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    labels.push({ key, label: value.trim() });
+  });
+  return labels;
+}
+
+function buildCountMatrix(
+  facts: LinkedCrewFact[],
+  rowValues: string[],
+  columnValues: string[],
+  rowValue: (fact: LinkedCrewFact) => string,
+  columnValue: (fact: LinkedCrewFact) => string,
+): CountMatrix {
+  const rows = orderedLabels(rowValues);
+  const columns = orderedLabels(columnValues);
+  const counts = new Map<string, Map<string, number>>();
+  facts.forEach((fact) => {
+    const rowKey = normalizedLabel(rowValue(fact));
+    const columnKey = normalizedLabel(columnValue(fact));
+    const row = counts.get(rowKey) ?? new Map<string, number>();
+    row.set(columnKey, (row.get(columnKey) ?? 0) + 1);
+    counts.set(rowKey, row);
+  });
+  const matrixRows = rows.map(({ key, label }) => {
+    const values = columns.map((column) => counts.get(key)?.get(column.key) ?? 0);
+    return { label, values, total: values.reduce((sum, value) => sum + value, 0) };
+  }).filter((row) => row.total > 0);
+  const columnTotals = columns.map((_, columnIndex) => matrixRows.reduce(
+    (sum, row) => sum + row.values[columnIndex],
+    0,
+  ));
+  return {
+    columns: columns.filter((_, index) => columnTotals[index] > 0).map((column) => column.label),
+    rows: matrixRows.map((row) => ({
+      ...row,
+      values: row.values.filter((_, index) => columnTotals[index] > 0),
+    })),
+    columnTotals: columnTotals.filter((value) => value > 0),
+    total: matrixRows.reduce((sum, row) => sum + row.total, 0),
+  };
+}
+
 export function calculateStripsSummary(strips: WorkStrip[]): StripsSummary {
   const crewByType = new Map<UavType, StatusCounts>();
   const positionByType = new Map<UavType, StatusCounts>();
@@ -691,6 +761,7 @@ export function calculateStripsSummary(strips: WorkStrip[]): StripsSummary {
   const emptyPositionsByType = new Map<UavType, number>();
   const seenPositions = new Set<string>();
   const seenCrews = new Set<string>();
+  const linkedCrewFacts: LinkedCrewFact[] = [];
   let crewsWithoutPosition = 0;
   let positionsWithoutCrews = 0;
 
@@ -723,6 +794,13 @@ export function calculateStripsSummary(strips: WorkStrip[]): StripsSummary {
           if (seenCrews.has(crewKey)) return;
           seenCrews.add(crewKey);
           addStatus(countsFor(crewByType, group.uavType as UavType), crew.readiness);
+          if (CREW_READINESS.includes(crew.readiness as CrewReadiness)) {
+            linkedCrewFacts.push({
+              strip: strip.name,
+              unit: group.unit,
+              uavType: group.uavType as UavType,
+            });
+          }
         });
       });
       group.looseCrews.forEach((crew) => {
@@ -730,7 +808,6 @@ export function calculateStripsSummary(strips: WorkStrip[]): StripsSummary {
         const crewKey = nameKey ? `name:${nameKey}` : `id:${crew.id}`;
         if (seenCrews.has(crewKey)) return;
         seenCrews.add(crewKey);
-        addStatus(countsFor(crewByType, group.uavType as UavType), crew.readiness);
         crewsWithoutPosition += 1;
         looseCrewsByType.set(
           group.uavType as UavType,
@@ -758,6 +835,11 @@ export function calculateStripsSummary(strips: WorkStrip[]): StripsSummary {
     forming: sum.forming + row.forming,
     total: sum.total + row.total,
   }), emptyCounts());
+  const units = linkedCrewFacts.map((fact) => fact.unit);
+  const stripNames = strips
+    .map((strip) => strip.name)
+    .filter((stripName) => linkedCrewFacts.some((fact) => normalizedLabel(fact.strip) === normalizedLabel(stripName)));
+  const uavTypes = UAV_TYPES.filter((uavType) => linkedCrewFacts.some((fact) => fact.uavType === uavType));
 
   return {
     crews,
@@ -767,6 +849,27 @@ export function calculateStripsSummary(strips: WorkStrip[]): StripsSummary {
     exceptions,
     crewsWithoutPosition,
     positionsWithoutCrews,
+    crewsByUnitAndStrip: buildCountMatrix(
+      linkedCrewFacts,
+      units,
+      stripNames,
+      (fact) => fact.unit,
+      (fact) => fact.strip,
+    ),
+    crewsByUnitAndUavType: buildCountMatrix(
+      linkedCrewFacts,
+      units,
+      uavTypes,
+      (fact) => fact.unit,
+      (fact) => fact.uavType,
+    ),
+    crewsByStripAndUavType: buildCountMatrix(
+      linkedCrewFacts,
+      stripNames,
+      uavTypes,
+      (fact) => fact.strip,
+      (fact) => fact.uavType,
+    ),
   };
 }
 

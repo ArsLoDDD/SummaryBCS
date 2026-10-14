@@ -227,11 +227,18 @@ fn worksheet_path(archive: &mut ZipArchive<File>, expected_name: &str) -> Result
     Ok(path)
 }
 
-pub fn read_bcs_sheet(archive: &mut ZipArchive<File>) -> Result<Vec<SheetRow>, String> {
+pub fn read_sheet(
+    archive: &mut ZipArchive<File>,
+    expected_name: &str,
+) -> Result<Vec<SheetRow>, String> {
     let shared = shared_strings(archive)?;
-    let path = worksheet_path(archive, "БЧС")?;
+    let path = worksheet_path(archive, expected_name)?;
     let xml = read_text(archive, &path)?;
     Ok(worksheet_rows(&xml, &shared))
+}
+
+pub fn read_bcs_sheet(archive: &mut ZipArchive<File>) -> Result<Vec<SheetRow>, String> {
+    read_sheet(archive, "БЧС")
 }
 
 fn esc(value: &str) -> String {

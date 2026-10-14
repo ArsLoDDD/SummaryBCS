@@ -141,7 +141,7 @@ describe("strips report", () => {
 
     const summary = calculateStripsSummary(report.strips);
     expect(summary.positionTotals.total).toBe(1);
-    expect(summary.crewTotals).toEqual({ ready: 1, notReady: 0, forming: 1, total: 2 });
+    expect(summary.crewTotals).toEqual({ ready: 1, notReady: 0, forming: 0, total: 1 });
     expect(summary.positionsWithoutCrews).toBe(1);
     expect(summary.crewsWithoutPosition).toBe(1);
     expect(summary.exceptions).toEqual([
@@ -149,10 +149,10 @@ describe("strips report", () => {
       { uavType: "Бомбер", crewsWithoutPosition: 0, positionsWithoutCrews: 1 },
     ]);
     expect(summary.positions.some((row) => row.uavType === "Бомбер")).toBe(false);
-    expect(summary.crews.some((row) => row.uavType === "Коптер")).toBe(true);
+    expect(summary.crews.some((row) => row.uavType === "Коптер")).toBe(false);
   });
 
-  it("detaches an incompatible crew atomically and still counts it as not ready", () => {
+  it("detaches an incompatible crew atomically and reports it outside the main summary", () => {
     const report = validReport();
     const group = report.strips[0].groups[0];
     const position = group.positions[0];
@@ -164,7 +164,7 @@ describe("strips report", () => {
     expect(changed.looseCrews.map((crew) => crew.id)).toEqual([second.id]);
     const summary = calculateStripsSummary([{ ...report.strips[0], groups: [changed] }]);
     expect(summary.positionTotals).toEqual({ ready: 1, notReady: 0, forming: 0, total: 1 });
-    expect(summary.crewTotals).toEqual({ ready: 1, notReady: 1, forming: 0, total: 2 });
+    expect(summary.crewTotals).toEqual({ ready: 1, notReady: 0, forming: 0, total: 1 });
     expect(summary.crewsWithoutPosition).toBe(1);
   });
 
@@ -248,7 +248,11 @@ describe("strips report", () => {
     report.strips.push(secondStrip);
 
     expect(validateStripsReport(report)).toContain("Екіпаж може бути лише в одному місці");
-    expect(calculateStripsSummary(report.strips).crewTotals.total).toBe(1);
+    const summary = calculateStripsSummary(report.strips);
+    expect(summary.crewTotals.total).toBe(1);
+    expect(summary.crewsByUnitAndStrip.total).toBe(1);
+    expect(summary.crewsByUnitAndUavType.total).toBe(1);
+    expect(summary.crewsByStripAndUavType.total).toBe(1);
   });
 
   it("creates a position for an existing crew and blocks that action for forming crews", () => {
@@ -348,7 +352,7 @@ describe("strips report", () => {
 
     const summary = calculateStripsSummary(report.strips);
     expect(report.strips).toHaveLength(3);
-    expect(summary.crewTotals).toEqual({ ready: 5, notReady: 1, forming: 1, total: 7 });
+    expect(summary.crewTotals).toEqual({ ready: 4, notReady: 1, forming: 0, total: 5 });
     expect(summary.positionTotals).toEqual({ ready: 2, notReady: 1, forming: 0, total: 3 });
     expect(summary.crewsWithoutPosition).toBe(2);
     expect(summary.positionsWithoutCrews).toBe(1);
