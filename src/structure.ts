@@ -304,7 +304,7 @@ export function formatReportDateForExport(value: string): string {
 function capitalizeNamePart(value: string): string {
   return value
     .toLocaleLowerCase("uk-UA")
-    .replace(/(^|[-'’.])([\p{L}])/gu, (_, separator: string, letter: string) =>
+    .replace(/(^|[-.])([\p{L}])/gu, (_, separator: string, letter: string) =>
       `${separator}${letter.toLocaleUpperCase("uk-UA")}`,
     );
 }
@@ -337,6 +337,10 @@ export function emptyPerson(blockId: string): PersonInput {
   };
 }
 
+function hasMeaningfulText(value: string): boolean {
+  return /[^\s\u0085]/u.test(value);
+}
+
 export function personHasAnyData(person: PersonInput): boolean {
   return [
     person.position,
@@ -345,14 +349,15 @@ export function personHasAnyData(person: PersonInput): boolean {
     person.duties,
     person.location,
     person.note,
-  ].some((value) => value.trim());
+  ].some(hasMeaningfulText);
 }
 
 export function missingRequiredPersonFields(person: PersonInput): string[] {
   const missing: string[] = [];
-  if (!person.rank.trim()) missing.push("Звання");
-  if (!person.fullName.trim()) missing.push("П.І.Б.");
-  if (!person.location.trim()) missing.push("Де знаходиться");
+  if (!hasMeaningfulText(person.rank)) missing.push("Звання");
+  if (!hasMeaningfulText(person.fullName)) missing.push("П.І.Б.");
+  if (!hasMeaningfulText(person.location)) missing.push("Де знаходиться");
+  else if (!LOCATIONS.includes(person.location)) missing.push("Де знаходиться (оберіть зі списку)");
   return missing;
 }
 

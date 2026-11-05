@@ -45,6 +45,7 @@ export interface RegistryGeneralRow {
 }
 
 export type RegistryGeneralSortKey =
+  | "tableOrder"
   | "crew"
   | "position"
   | "strip"
@@ -61,6 +62,7 @@ export type RegistryGeneralSortKey =
   | "assignmentState";
 
 export type RegistryCrewSortKey =
+  | "tableOrder"
   | "name"
   | "unit"
   | "uavType"
@@ -74,6 +76,7 @@ export type RegistryCrewSortKey =
   | "assignmentState";
 
 export type RegistryPositionSortKey =
+  | "tableOrder"
   | "name"
   | "strip"
   | "unit"
@@ -204,6 +207,14 @@ function stableSort<T>(
     .map(({ row }) => row);
 }
 
+function sourceOrderValue(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const sourceOrder = (value as { sourceOrder?: unknown }).sourceOrder;
+  return typeof sourceOrder === "number" && Number.isFinite(sourceOrder)
+    ? String(sourceOrder)
+    : "";
+}
+
 function crewReadinessLabel(crew: RegistryCrew | null): string {
   if (!crew?.readiness) return "";
   return readinessDisplay(crew.readiness, crew.notReadyReason);
@@ -232,17 +243,23 @@ export function registryGeneralAssignmentState(row: RegistryGeneralRow): Registr
 
 export function buildRegistryGeneralRows(data: StripsRegistryData): RegistryGeneralRow[] {
   const relations = createRelations(data);
-  const rows: RegistryGeneralRow[] = data.crews.map((crew) => {
-    const assignment = relations.assignmentByCrewId.get(crew.id) ?? null;
-    const position = assignment
-      ? relations.positionById.get(assignment.positionId) ?? null
-      : null;
-    return { key: `crew-${crew.id}`, crew, position, assignment };
-  });
-  const usedPositionIds = new Set(rows.map((row) => row.position?.id).filter(Boolean));
+  const rows: RegistryGeneralRow[] = [];
+  const linkedCrewIds = new Set<string>();
   for (const position of data.positions) {
-    if (!usedPositionIds.has(position.id)) {
+    const crews = relations.crewsByPositionId.get(position.id) ?? [];
+    if (crews.length === 0) {
       rows.push({ key: `position-${position.id}`, crew: null, position, assignment: null });
+      continue;
+    }
+    for (const crew of crews) {
+      const assignment = relations.assignmentByCrewId.get(crew.id) ?? null;
+      linkedCrewIds.add(crew.id);
+      rows.push({ key: `crew-${crew.id}`, crew, position, assignment });
+    }
+  }
+  for (const crew of data.crews) {
+    if (!linkedCrewIds.has(crew.id)) {
+      rows.push({ key: `crew-${crew.id}`, crew, position: null, assignment: null });
     }
   }
   return rows;
@@ -276,6 +293,7 @@ function generalSearchValues(row: RegistryGeneralRow): string[] {
 
 function generalSortValue(row: RegistryGeneralRow, key: RegistryGeneralSortKey): string {
   switch (key) {
+    case "tableOrder": return sourceOrderValue(row.crew) || sourceOrderValue(row.position);
     case "crew": return row.crew?.name || "";
     case "position": return row.position?.name || "";
     case "strip": return row.position?.strip || "";
@@ -334,6 +352,7 @@ function crewSortValue(
 ): string {
   const position = positionForCrew(crew, relations);
   switch (key) {
+    case "tableOrder": return sourceOrderValue(crew);
     case "name": return crew.name;
     case "unit": return crew.unit;
     case "uavType": return crew.uavType;
@@ -395,6 +414,7 @@ function positionSortValue(
 ): string {
   const crews = relations.crewsByPositionId.get(position.id) ?? [];
   switch (key) {
+    case "tableOrder": return sourceOrderValue(position);
     case "name": return position.name;
     case "strip": return position.strip;
     case "unit": return position.unit;

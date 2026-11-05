@@ -52,6 +52,8 @@ export interface ComparisonResult {
   sections: ComparisonSection[];
   unitChanges: string[];
   personnelChanges: PersonnelChange[];
+  structureChanges: string[];
+  warnings: string[];
   hasChanges: boolean;
 }
 

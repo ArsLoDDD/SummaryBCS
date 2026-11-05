@@ -96,6 +96,54 @@ export interface StripsSummary {
   crewsByStripAndUavType: CountMatrix;
 }
 
+interface OperationalUnitOrderKey {
+  special: boolean;
+  number: string | null;
+}
+
+function operationalUnitOrderKey(value: string): OperationalUnitOrderKey {
+  const normalized = value.trim().replace(/\s+/g, " ").toLocaleUpperCase("uk-UA");
+  const special = /(?:^|[^\p{L}])(РБАК|РУБАК)(?=$|[^\p{L}])/u.test(normalized);
+  const numberMatch = normalized.match(/\d+/u);
+  const number = numberMatch?.[0].replace(/^0+/u, "") || (numberMatch ? "0" : null);
+  return {
+    special,
+    number,
+  };
+}
+
+function compareOperationalUnitNumbers(left: string, right: string): number {
+  if (left.length !== right.length) return left.length - right.length;
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+/**
+ * Keeps operational units in the agreed reporting order without rearranging
+ * equal-priority or ordinary units: bare РБАК/РУБАК, numbered РБАК/РУБАК,
+ * then every other unit in its source order.
+ */
+export function compareOperationalUnitLabels(left: string, right: string): number {
+  const leftKey = operationalUnitOrderKey(left);
+  const rightKey = operationalUnitOrderKey(right);
+  if (leftKey.special !== rightKey.special) return leftKey.special ? -1 : 1;
+  if (!leftKey.special) return 0;
+  if (leftKey.number === null && rightKey.number !== null) return -1;
+  if (leftKey.number !== null && rightKey.number === null) return 1;
+  if (leftKey.number !== null && rightKey.number !== null) {
+    return compareOperationalUnitNumbers(leftKey.number, rightKey.number);
+  }
+  return 0;
+}
+
+export function sortOperationalUnitLabels(values: string[]): string[] {
+  return values
+    .map((value, index) => ({ value, index }))
+    .sort((left, right) => compareOperationalUnitLabels(left.value, right.value)
+      || left.index - right.index)
+    .map(({ value }) => value);
+}
+
 let nextId = 1;
 
 function id(prefix: string): string {
@@ -835,7 +883,7 @@ export function calculateStripsSummary(strips: WorkStrip[]): StripsSummary {
     forming: sum.forming + row.forming,
     total: sum.total + row.total,
   }), emptyCounts());
-  const units = linkedCrewFacts.map((fact) => fact.unit);
+  const units = sortOperationalUnitLabels(linkedCrewFacts.map((fact) => fact.unit));
   const stripNames = strips
     .map((strip) => strip.name)
     .filter((stripName) => linkedCrewFacts.some((fact) => normalizedLabel(fact.strip) === normalizedLabel(stripName)));

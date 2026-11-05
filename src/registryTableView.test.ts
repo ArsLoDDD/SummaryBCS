@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type {
-  RegistryAssignment,
-  RegistryCrew,
-  RegistryPosition,
-  StripsRegistryData,
+import {
+  normalizeStripsRegistry,
+  type RegistryAssignment,
+  type RegistryCrew,
+  type RegistryPosition,
+  type StripsRegistryData,
 } from "./stripsRegistry";
 import {
   buildRegistryGeneralRows,
@@ -136,12 +137,12 @@ describe("registry table views", () => {
     expect(rows.map((row) => row.key)).toEqual([
       "crew-c-2",
       "crew-c-10",
-      "crew-c-1",
       "position-p-1",
+      "crew-c-1",
     ]);
     expect(rows[0].crew).toBe(data.crews[0]);
     expect(rows[0].position).toBe(data.positions[0]);
-    expect(rows[3].position).toBe(data.positions[2]);
+    expect(rows[2].position).toBe(data.positions[2]);
     expect(data).toEqual(before);
   });
 
@@ -156,7 +157,7 @@ describe("registry table views", () => {
       .toEqual([]);
     expect(viewRegistryGeneralRows(data, { search: "без позиції" }).map((row) => row.key))
       .toEqual(["crew-c-1"]);
-    expect(registryGeneralRowNote(buildRegistryGeneralRows(data)[3]))
+    expect(registryGeneralRowNote(buildRegistryGeneralRows(data)[2]))
       .toContain("Позиція готова до роботи, відсутній екіпаж");
   });
 
@@ -218,6 +219,57 @@ describe("registry table views", () => {
       .toEqual(["crew-c-2", "position-p-1", "crew-c-10", "crew-c-1"]);
     expect(data.crews.map((item) => item.id)).toEqual(sourceCrewIds);
     expect(data.positions.map((item) => item.id)).toEqual(sourcePositionIds);
+  });
+
+  it("restores imported table order from sourceOrder and keeps missing order values stable at the end", () => {
+    const data = fixture();
+    data.crews.push(crew({ id: "c-new", name: "НОВИЙ ЕКІПАЖ" }));
+    const ordered = <T extends object>(value: T, sourceOrder: number) => {
+      (value as T & { sourceOrder: number }).sourceOrder = sourceOrder;
+    };
+    ordered(data.crews[0], 30);
+    ordered(data.crews[1], 10);
+    ordered(data.crews[2], 25);
+    ordered(data.positions[0], 30);
+    ordered(data.positions[1], 10);
+    ordered(data.positions[2], 20);
+
+    expect(viewRegistryGeneralRows(data, { sort: { key: "tableOrder", direction: "asc" } }).map((row) => row.key))
+      .toEqual(["crew-c-10", "position-p-1", "crew-c-1", "crew-c-2", "crew-c-new"]);
+    expect(viewRegistryCrews(data, { sort: { key: "tableOrder", direction: "asc" } }).map((crew) => crew.id))
+      .toEqual(["c-10", "c-1", "c-2", "c-new"]);
+    expect(viewRegistryPositions(data, { sort: { key: "tableOrder", direction: "asc" } }).map((position) => position.id))
+      .toEqual(["p-10", "p-1", "p-2"]);
+  });
+
+  it("keeps a realistic imported sequence with two crews on one position", () => {
+    const imported = normalizeStripsRegistry({
+      version: 2,
+      reportDate: "2026-10-14",
+      crews: [
+        { ...crew({ id: "row-6", name: "СОКІЛ-1" }), sourceOrder: 6 },
+        { ...crew({ id: "row-7", name: "СОКІЛ-2" }), sourceOrder: 7 },
+        { ...crew({ id: "row-9", name: "РЕЗЕРВ" }), sourceOrder: 9 },
+      ],
+      positions: [
+        { ...position({ id: "position-6", name: "ПОЗИЦІЯ СОКІЛ" }), sourceOrder: 6 },
+        { ...position({ id: "position-8", name: "РЕЗЕРВНА ПОЗИЦІЯ" }), sourceOrder: 8 },
+      ],
+      assignments: [
+        assignment("assignment-6", "row-6", "position-6"),
+        assignment("assignment-7", "row-7", "position-6"),
+      ],
+    });
+
+    expect(imported).not.toBeNull();
+    expect(viewRegistryGeneralRows(imported!, {
+      sort: { key: "tableOrder", direction: "asc" },
+    }).map((row) => row.key)).toEqual([
+      "crew-row-6",
+      "crew-row-7",
+      "position-position-8",
+      "crew-row-9",
+    ]);
   });
 
   it("collects normalized, unique options for every filter", () => {

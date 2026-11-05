@@ -3,6 +3,7 @@ import {
   CREW_DUTIES,
   CREW_READINESS,
   POSITION_READINESS,
+  compareOperationalUnitLabels,
   syncCrewSystemNote,
   syncPositionSystemNote,
   upperUk,
@@ -19,6 +20,7 @@ import {
 
 export interface RegistryCrew {
   id: string;
+  sourceOrder?: number;
   name: string;
   unit: string;
   uavType: UavType | "";
@@ -31,6 +33,7 @@ export interface RegistryCrew {
 
 export interface RegistryPosition {
   id: string;
+  sourceOrder?: number;
   name: string;
   strip: string;
   unit: string;
@@ -415,6 +418,7 @@ interface GroupBuilder {
   uavType: UavType | "";
   positions: StripPosition[];
   looseCrews: StripCrew[];
+  sourceOrder?: number;
   order: number;
 }
 
@@ -446,16 +450,28 @@ export function registryToStripsReport(data: StripsRegistryData): StripsReport {
 
   const builders = new Map<string, GroupBuilder>();
   let nextOrder = 0;
-  const builderFor = (stripName: string, unit: string, uavType: UavType | "") => {
+  const builderFor = (
+    stripName: string,
+    unit: string,
+    uavType: UavType | "",
+    sourceOrder?: number,
+  ) => {
     const key = `${normalizedLabel(stripName)}\u0000${normalizedLabel(uavType)}\u0000${normalizedLabel(unit)}`;
     const current = builders.get(key);
-    if (current) return current;
+    if (current) {
+      if (sourceOrder !== undefined
+        && (current.sourceOrder === undefined || sourceOrder < current.sourceOrder)) {
+        current.sourceOrder = sourceOrder;
+      }
+      return current;
+    }
     const created: GroupBuilder = {
       stripName,
       unit,
       uavType,
       positions: [],
       looseCrews: [],
+      sourceOrder,
       order: nextOrder++,
     };
     builders.set(key, created);
@@ -475,17 +491,26 @@ export function registryToStripsReport(data: StripsRegistryData): StripsReport {
       note: position.note,
       crews,
     });
-    builderFor(position.strip, position.unit, position.uavType).positions.push(exportedPosition);
+    builderFor(position.strip, position.unit, position.uavType, position.sourceOrder)
+      .positions.push(exportedPosition);
   });
 
   data.crews.forEach((crew) => {
     if (linkedCrewIds.has(crew.id)) return;
-    builderFor(UNASSIGNED_STRIP_NAME, crew.unit, crew.uavType).looseCrews.push(toStripCrew(crew, true));
+    builderFor(UNASSIGNED_STRIP_NAME, crew.unit, crew.uavType, crew.sourceOrder)
+      .looseCrews.push(toStripCrew(crew, true));
   });
 
   const stripNames: string[] = [];
   const stripKeys = new Set<string>();
-  [...builders.values()].sort((a, b) => a.order - b.order).forEach((builder) => {
+  [...builders.values()].sort((a, b) => {
+    if (a.sourceOrder !== undefined && b.sourceOrder !== undefined) {
+      return a.sourceOrder - b.sourceOrder || a.order - b.order;
+    }
+    if (a.sourceOrder !== undefined) return -1;
+    if (b.sourceOrder !== undefined) return 1;
+    return a.order - b.order;
+  }).forEach((builder) => {
     const key = normalizedLabel(builder.stripName);
     if (stripKeys.has(key)) return;
     stripKeys.add(key);
@@ -502,7 +527,13 @@ export function registryToStripsReport(data: StripsRegistryData): StripsReport {
         const bType = UAV_TYPES.indexOf(b.uavType as UavType);
         const safeA = aType < 0 ? UAV_TYPES.length : aType;
         const safeB = bType < 0 ? UAV_TYPES.length : bType;
-        return safeA - safeB || a.order - b.order;
+        return safeA - safeB
+          || compareOperationalUnitLabels(a.unit, b.unit)
+          || (a.sourceOrder !== undefined && b.sourceOrder !== undefined
+            ? a.sourceOrder - b.sourceOrder
+            : 0)
+          || (a.sourceOrder === undefined ? 1 : 0) - (b.sourceOrder === undefined ? 1 : 0)
+          || a.order - b.order;
       })
       .map((builder, groupIndex) => ({
         id: `registry-group-${stripIndex + 1}-${groupIndex + 1}`,
@@ -519,6 +550,12 @@ export function registryToStripsReport(data: StripsRegistryData): StripsReport {
 
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function sourceOrderValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
 }
 
 export function normalizeStripsRegistry(value: unknown): StripsRegistryData | null {
@@ -549,8 +586,10 @@ export function normalizeStripsRegistry(value: unknown): StripsRegistryData | nu
     const readiness = CREW_READINESS.includes(crew.readiness as CrewReadiness)
       ? crew.readiness as CrewReadiness
       : "";
+    const sourceOrder = sourceOrderValue(crew.sourceOrder);
     crews.push({
       id: crew.id,
+      ...(sourceOrder === undefined ? {} : { sourceOrder }),
       name: stringValue(crew.name),
       unit: stringValue(crew.unit),
       uavType: typeof crew.uavType === "string" && uavTypes.has(crew.uavType)
@@ -575,8 +614,10 @@ export function normalizeStripsRegistry(value: unknown): StripsRegistryData | nu
     const readiness = POSITION_READINESS.includes(position.readiness as PositionReadiness)
       ? position.readiness as PositionReadiness
       : "";
+    const sourceOrder = sourceOrderValue(position.sourceOrder);
     positions.push({
       id: position.id,
+      ...(sourceOrder === undefined ? {} : { sourceOrder }),
       name: stringValue(position.name),
       strip: stringValue(position.strip),
       unit: stringValue(position.unit),

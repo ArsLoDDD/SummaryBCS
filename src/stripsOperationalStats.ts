@@ -1,5 +1,6 @@
 import {
   CREW_READINESS,
+  compareOperationalUnitLabels,
   type CrewReadiness,
   type StatusCounts,
   type StripCrew,
@@ -223,7 +224,13 @@ export function calculateStripsOperationalStats(strips: WorkStrip[]): StripsOper
     else coverage.positionsEmpty += 1;
   }
 
-  const coverageRows = units.flatMap(({ key, label }) => {
+  const orderedUnits = units
+    .map((unit, index) => ({ unit, index }))
+    .sort((left, right) => compareOperationalUnitLabels(left.unit.label, right.unit.label)
+      || left.index - right.index)
+    .map(({ unit }) => unit);
+
+  const coverageRows = orderedUnits.flatMap(({ key, label }) => {
     const counts = coverageByUnit.get(key);
     if (!counts) return [];
     const finalized = finalizeCoverage(counts);
@@ -242,7 +249,7 @@ export function calculateStripsOperationalStats(strips: WorkStrip[]): StripsOper
   ));
 
   return {
-    readinessByUnit: buildReadinessRows(linkedCrews.values(), units, (fact) => fact.unit),
+    readinessByUnit: buildReadinessRows(linkedCrews.values(), orderedUnits, (fact) => fact.unit),
     readinessByStrip: buildReadinessRows(linkedCrews.values(), stripLabels, (fact) => fact.strip),
     coverageByUnit: coverageRows,
     coverageOverall,

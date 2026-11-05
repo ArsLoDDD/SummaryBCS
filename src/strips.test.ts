@@ -15,6 +15,7 @@ import {
   normalizeStripsReport,
   readinessDisplay,
   setCrewReadinessInGroup,
+  sortOperationalUnitLabels,
   validateStripsReport,
   validateStripsReportErrors,
   type StripsReport,
@@ -106,6 +107,62 @@ describe("strips report", () => {
     expect(summary.positions).toEqual([
       { uavType: "ФПВ", ready: 2, notReady: 0, forming: 0, total: 2 },
     ]);
+  });
+
+  it("orders РБАК and РУБАК units before other units without disturbing equal-priority rows", () => {
+    expect(sortOperationalUnitLabels(["Саперний взвод", "ПРУБАК", "1РУБАК"]))
+      .toEqual(["1РУБАК", "Саперний взвод", "ПРУБАК"]);
+    expect(sortOperationalUnitLabels([
+      "9007199254740993 РУБАК",
+      "9007199254740992 РБАК",
+      "0002 РБАК",
+    ])).toEqual([
+      "0002 РБАК",
+      "9007199254740992 РБАК",
+      "9007199254740993 РУБАК",
+    ]);
+    expect(sortOperationalUnitLabels([
+      "Саперний взвод",
+      "10 РУБАК",
+      "РУБАК",
+      "2 РБАК",
+      "Рота НРК",
+      "РБАК",
+      "1 РУБАК",
+      "1 РБАК",
+    ])).toEqual([
+      "РУБАК",
+      "РБАК",
+      "1 РУБАК",
+      "1 РБАК",
+      "2 РБАК",
+      "10 РУБАК",
+      "Саперний взвод",
+      "Рота НРК",
+    ]);
+
+    const strip = createStrip("Смуга ПІВНІЧ");
+    strip.groups = ["Саперний взвод", "10 РУБАК", "РУБАК", "2 РБАК", "Рота НРК", "РБАК"]
+      .map((unit, index) => {
+        const group = createGroup();
+        group.unit = unit;
+        group.uavType = "ФПВ";
+        Object.assign(group.positions[0], {
+          id: `position-${index}`,
+          readiness: "БГ",
+          crews: [{
+            ...createCrew(),
+            id: `crew-${index}`,
+            name: `Екіпаж ${index}`,
+            readiness: "БГ",
+            duty: "БЧ",
+          }],
+        });
+        return group;
+      });
+
+    expect(calculateStripsSummary([strip]).crewsByUnitAndStrip.rows.map((row) => row.label))
+      .toEqual(["РУБАК", "РБАК", "2 РБАК", "10 РУБАК", "Саперний взвод", "Рота НРК"]);
   });
 
   it("counts every crew once and reports records without links separately", () => {

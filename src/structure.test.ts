@@ -67,6 +67,19 @@ describe("structure helpers", () => {
     expect(missingRequiredPersonFields(complete)).toEqual([]);
   });
 
+  it("treats Unicode whitespace, NEL and BOM as empty in every required person field", () => {
+    for (const whitespace of [" ", "\t\n", "\u0085", "\ufeff", "\u0085\ufeff \u2003"]) {
+      const blank = { ...emptyPerson("crew"), rank: whitespace, fullName: whitespace, location: whitespace, duties: whitespace, position: whitespace, note: whitespace };
+      expect(personHasAnyData(blank), JSON.stringify(whitespace)).toBe(false);
+      expect(missingRequiredPersonFields(blank)).toEqual(["Звання", "П.І.Б.", "Де знаходиться"]);
+      const valid = { ...blank, rank: "солдат", fullName: "ТЕСТОВИЙ Іван", location: "ПУ" };
+      expect(missingRequiredPersonFields({ ...valid, rank: whitespace })).toEqual(["Звання"]);
+      expect(missingRequiredPersonFields({ ...valid, fullName: whitespace })).toEqual(["П.І.Б."]);
+      expect(missingRequiredPersonFields({ ...valid, location: whitespace })).toEqual(["Де знаходиться"]);
+      expect(personHasAnyData({ ...blank, note: "Відомі часткові дані" })).toBe(true);
+    }
+  });
+
   it("keeps authorized strength informational and independent from personnel rows", () => {
     expect(validateWorkspace("", "2026-10-08", "company", 5, blocks)).toBe("Вкажіть назву підрозділу.");
     expect(validateWorkspace("Рота", "2026-10-08", "company", 4, blocks)).toBe("");
@@ -86,6 +99,7 @@ describe("structure helpers", () => {
   it("keeps only the surname in uppercase", () => {
     expect(formatFullName("іванов іВАН іванович")).toBe("ІВАНОВ Іван Іванович");
     expect(formatFullName("  петренко  о.п. ")).toBe("  ПЕТРЕНКО  О.П. ");
+    expect(formatFullName("п’ятенко мар’яна лук'янівна")).toBe("П’ЯТЕНКО Мар’яна Лук'янівна");
   });
 
   it("uppercases crew names but only starts other block names with a capital letter", () => {

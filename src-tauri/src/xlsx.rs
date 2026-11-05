@@ -10,6 +10,13 @@ const MAX_XML_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_UNCOMPRESSED_BYTES: u64 = 80 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 512;
 
+pub(crate) fn validate_export_sheet_size(sheet: &str) -> Result<(), String> {
+    if sheet.len() as u64 > MAX_XML_BYTES {
+        return Err("Обсяг даних аркуша перевищує безпечний ліміт 20 МБ. Файл не створено. Розділіть дані на окремі БЧС або скоротіть довгі текстові поля.".into());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Cell {
     pub value: String,
@@ -305,6 +312,7 @@ pub fn write_bcs_workbook(
     styles: &str,
     theme: &str,
 ) -> Result<(), String> {
+    validate_export_sheet_size(bcs_sheet_xml)?;
     let file = File::create(path).map_err(|_| "Не вдалося створити Excel-файл.".to_string())?;
     let mut archive = ZipWriter::new(file);
     let options = SimpleFileOptions::default();

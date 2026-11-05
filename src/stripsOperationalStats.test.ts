@@ -184,4 +184,29 @@ describe("strips operational statistics", () => {
       positionStaffingRatePercent: 0,
     }]);
   });
+
+  it("uses the reporting unit order in readiness and coverage tables", () => {
+    const strip = createStrip("Смуга ПІВНІЧ");
+    strip.groups = ["Саперний взвод", "10 РБАК", "РУБАК", "2 РУБАК", "Рота НРК", "РБАК"]
+      .map((unit, index) => {
+        const group = createGroup();
+        group.unit = unit;
+        group.uavType = "ФПВ";
+        group.positions = [createPosition([{
+          ...createCrew(),
+          id: `crew-${index}`,
+          name: `Екіпаж ${index}`,
+          readiness: "БГ",
+          duty: "БЧ",
+        }])];
+        group.positions[0].id = `position-${index}`;
+        group.positions[0].readiness = "БГ";
+        return group;
+      });
+
+    const stats = calculateStripsOperationalStats([strip]);
+    const expected = ["РУБАК", "РБАК", "2 РУБАК", "10 РБАК", "Саперний взвод", "Рота НРК"];
+    expect(stats.readinessByUnit.map((row) => row.label)).toEqual(expected);
+    expect(stats.coverageByUnit.map((row) => row.label)).toEqual(expected);
+  });
 });

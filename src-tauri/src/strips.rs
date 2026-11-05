@@ -1,6 +1,7 @@
 use crate::xlsx;
 use serde::{Deserialize, Serialize};
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     fs::{self, File},
     path::PathBuf,
@@ -96,6 +97,8 @@ pub struct ImportedStripsRegistry {
 #[serde(rename_all = "camelCase")]
 struct ImportedRegistryCrew {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_order: Option<usize>,
     name: String,
     unit: String,
     uav_type: String,
@@ -110,6 +113,8 @@ struct ImportedRegistryCrew {
 #[serde(rename_all = "camelCase")]
 struct ImportedRegistryPosition {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_order: Option<usize>,
     name: String,
     strip: String,
     unit: String,
@@ -561,6 +566,7 @@ fn parse_imported_crew(
     let note = validate_text(note, &format!("Примітка екіпажу: {label}"), 1_000, false)?;
     Ok(ImportedRegistryCrew {
         id: format!("import-crew-{crew_number}"),
+        source_order: Some(row.number),
         name,
         unit: unit.to_string(),
         uav_type: uav_type.to_string(),
@@ -770,6 +776,7 @@ fn parse_registry_sheet(rows: &[xlsx::SheetRow]) -> Result<ImportedStripsRegistr
                 first_crew_note = crew_note;
                 let position = ImportedRegistryPosition {
                     id: format!("import-position-{}", positions.len() + 1),
+                    source_order: Some(row.number),
                     name: validate_text(
                         position_name,
                         &format!("Назва позиції: {label}"),
@@ -1262,6 +1269,51 @@ fn normalize(value: &str) -> String {
         .to_lowercase()
 }
 
+fn is_priority_unit(value: &str) -> bool {
+    normalize(value)
+        .split(|character: char| !character.is_alphabetic())
+        .any(|token| matches!(token, "рбак" | "рубак"))
+}
+
+fn first_unit_number(value: &str) -> Option<String> {
+    let digits = value
+        .chars()
+        .skip_while(|character| !character.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    let significant = digits.trim_start_matches('0');
+    Some(if significant.is_empty() {
+        "0".to_string()
+    } else {
+        significant.to_string()
+    })
+}
+
+fn compare_unit_numbers(left: &str, right: &str) -> Ordering {
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+/// Keeps ordinary units in their source order while moving РБАК/РУБАК units
+/// to the front: unnumbered names first, then numbered names numerically.
+/// Equal priority keys intentionally compare equal so Rust's stable sort keeps
+/// the physical order imported from the workbook.
+fn compare_strip_units(left: &str, right: &str) -> Ordering {
+    match (is_priority_unit(left), is_priority_unit(right)) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => Ordering::Equal,
+        (true, true) => match (first_unit_number(left), first_unit_number(right)) {
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+            (Some(left), Some(right)) => compare_unit_numbers(&left, &right),
+        },
+    }
+}
+
 fn canonical(value: &str, allowed: &[&str], label: &str) -> Result<String, String> {
     let normalized = normalize(value);
     allowed
@@ -1365,10 +1417,11 @@ fn calculate_summary(strips: &[PreparedStrip]) -> StripsSummary {
         })
         .collect::<Vec<_>>();
 
-    let units = linked_crew_facts
+    let mut units = linked_crew_facts
         .iter()
         .map(|fact| fact.unit.clone())
         .collect::<Vec<_>>();
+    units.sort_by(|left, right| compare_strip_units(left, right));
     let strip_names = strips
         .iter()
         .filter(|strip| {
@@ -1691,6 +1744,8 @@ fn calculate_operational_stats(strips: &[PreparedStrip]) -> StripsOperationalSta
             }
         }
     }
+
+    units.sort_by(|left, right| compare_strip_units(&left.label, &right.label));
 
     let mut coverage_by_unit: HashMap<String, LinkCoverageCounts> = HashMap::new();
     for fact in linked_crews.values() {
@@ -3047,6 +3102,140 @@ mod tests {
     }
 
     #[test]
+    fn orders_rbaks_and_rubaks_before_other_units_without_reordering_ties() {
+        assert_eq!(
+            compare_strip_units("1РУБАК", "Саперний взвод"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_strip_units("ПРУБАК", "Саперний взвод"),
+            Ordering::Equal
+        );
+        let mut units = vec![
+            "Саперний взвод",
+            "10 РУБАК",
+            "РУБАК",
+            "2 РБАК",
+            "РБАК",
+            "1 РУБАК",
+            "Рота НРК",
+            "2 РУБАК",
+            "ПРУБАК",
+            "0002 РБАК",
+        ];
+
+        units.sort_by(|left, right| compare_strip_units(left, right));
+
+        assert_eq!(
+            units,
+            vec![
+                "РУБАК",
+                "РБАК",
+                "1 РУБАК",
+                "2 РБАК",
+                "2 РУБАК",
+                "0002 РБАК",
+                "10 РУБАК",
+                "Саперний взвод",
+                "Рота НРК",
+                "ПРУБАК",
+            ]
+        );
+    }
+
+    #[test]
+    fn unit_summary_and_operational_rows_use_the_same_priority_order() {
+        let unit_names = [
+            "Саперний взвод",
+            "10 РУБАК",
+            "РУБАК",
+            "2 РБАК",
+            "РБАК",
+            "1 РУБАК",
+            "Рота НРК",
+        ];
+        let groups = unit_names
+            .iter()
+            .enumerate()
+            .map(|(index, unit)| {
+                let group_id = format!("ordered-group-{index}");
+                let position_id = format!("ordered-position-{index}");
+                let crew_id = format!("ordered-crew-{index}");
+                let crew_name = format!("Екіпаж {index}");
+                group(
+                    &group_id,
+                    unit,
+                    "ФПВ",
+                    vec![position(
+                        &position_id,
+                        vec![crew(&crew_id, &crew_name, "БГ", "")],
+                    )],
+                    Vec::new(),
+                )
+            })
+            .collect();
+        let value = StripsExportRequest {
+            version: 1,
+            report_date: "2026-10-14".into(),
+            strips: vec![WorkStrip {
+                id: "ordered-strip".into(),
+                name: "Смуга ПІВНІЧ".into(),
+                groups,
+            }],
+            output_path: "ordered.xlsx".into(),
+            separate_notes: false,
+            hide_unlinked_summary_caption: false,
+        };
+        let prepared = prepare_request(value).unwrap();
+        let summary = calculate_summary(&prepared.strips);
+        let stats = calculate_operational_stats(&prepared.strips);
+        let expected = vec![
+            "РУБАК",
+            "РБАК",
+            "1 РУБАК",
+            "2 РБАК",
+            "10 РУБАК",
+            "Саперний взвод",
+            "Рота НРК",
+        ];
+
+        assert_eq!(
+            summary
+                .crews_by_unit_and_strip
+                .rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            summary
+                .crews_by_unit_and_uav_type
+                .rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            stats
+                .readiness_by_unit
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            stats
+                .coverage_by_unit
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
     fn summary_counts_each_crew_once_and_reports_unlinked_entities() {
         let prepared = prepare_request(request("report.xlsx".into())).unwrap();
         let summary = calculate_summary(&prepared.strips);
@@ -3436,6 +3625,22 @@ mod tests {
             imported
                 .crews
                 .iter()
+                .map(|crew| crew.source_order)
+                .collect::<Vec<_>>(),
+            vec![Some(6), Some(7), Some(9)]
+        );
+        assert_eq!(
+            imported
+                .positions
+                .iter()
+                .map(|position| position.source_order)
+                .collect::<Vec<_>>(),
+            vec![Some(6), Some(8)]
+        );
+        assert_eq!(
+            imported
+                .crews
+                .iter()
                 .map(|crew| crew.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["Альфа", "Браво", "Екіпаж без позиції"]
@@ -3471,6 +3676,8 @@ mod tests {
         assert_eq!(json["version"], 2);
         assert_eq!(json["reportDate"], "2026-10-12");
         assert!(json["crews"][0].get("uavType").is_some());
+        assert_eq!(json["crews"][0]["sourceOrder"], 6);
+        assert_eq!(json["positions"][0]["sourceOrder"], 6);
         assert!(json["assignments"][0].get("crewId").is_some());
     }
 

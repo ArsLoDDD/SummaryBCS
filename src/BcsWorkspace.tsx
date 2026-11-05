@@ -1,9 +1,20 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
-import { ChevronDown, ChevronUp, Download, LoaderCircle, Minus, Plus, Trash2, Users } from "lucide-react";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { ChevronDown, ChevronUp, Download, LoaderCircle, Minus, Plus, Trash2, Upload, Users } from "lucide-react";
 import CustomSelect, { type CustomSelectOption } from "./CustomSelect";
-import { crewFunctionalSummaryRows } from "./bcsSummary";
+import BcsDataPanel from "./BcsDataPanel";
+import {
+  normalizeEditorData,
+  removeEditorBlock,
+  updateEditorBlock,
+  type BcsEditorData,
+} from "./bcsEditorData";
+import { restoreWorkspaceDraft, type RestoredWorkspace, type WorkspaceDraft } from "./bcsWorkspaceDraft";
+import { WorkspaceSaveQueue } from "./workspaceSaveQueue";
+import { buildBcsSheetSummary } from "./bcsSummary";
+import { clampNumberStepperValue, parseNumberStepperInput } from "./numberStepper";
 import {
   BCS_HEADERS,
   BLOCK_TYPES,
@@ -14,7 +25,6 @@ import {
   UAV_TYPES,
   createBlock,
   createDefaultCompanyBlocks,
-  deduplicateSingletonBlocks,
   defaultBlockName,
   emptyPerson,
   formatBlockName,
@@ -23,9 +33,9 @@ import {
   isSingletonBlockKind,
   isRequiredManagementBlock,
   missingRequiredPersonFields,
-  normalizeLegacyBlockName,
   normalizedSlots,
   peopleForExport,
+  personHasAnyData,
   personKey,
   quickBlockTypesForStructure,
   reconcileBlocksForStructure,
@@ -41,16 +51,6 @@ import {
 
 interface Props {
   variant: "template" | "editor";
-}
-
-interface WorkspaceDraft {
-  version: 1;
-  unitName: string;
-  reportDate: string;
-  structureType: StructureType;
-  authorizedStrength: number;
-  blocks: StructureBlock[];
-  peopleBySlot: Record<string, PersonInput>;
 }
 
 function tomorrow(): string {
@@ -70,10 +70,6 @@ function safeFilePart(value: string): string {
   return value.trim().replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, " ") || "Підрозділ";
 }
 
-function upper(value: string): string {
-  return value.toLocaleUpperCase("uk-UA");
-}
-
 function formatDateForSheet(value: string): string {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
   return match ? `${match[3]}.${match[2]}.${match[1]}` : value;
@@ -88,7 +84,11 @@ interface NumberStepperProps {
 }
 
 function NumberStepper({ ariaLabel, value, min, max, onChange }: NumberStepperProps) {
-  const apply = (next: number) => onChange(Math.min(max, Math.max(min, Math.trunc(next))));
+  const [isEmpty, setIsEmpty] = useState(false);
+  const apply = (next: number) => {
+    setIsEmpty(false);
+    onChange(clampNumberStepperValue(next, min, max));
+  };
 
   return (
     <div className="number-stepper">
@@ -97,11 +97,13 @@ function NumberStepper({ ariaLabel, value, min, max, onChange }: NumberStepperPr
         type="text"
         inputMode="numeric"
         pattern="[0-9]*"
-        value={value}
+        value={isEmpty ? "" : value}
         onChange={(event) => {
-          const digits = event.target.value.replace(/\D/g, "");
-          apply(digits ? Number(digits) : min);
+          const next = parseNumberStepperInput(event.target.value, min, max);
+          if (next === null) setIsEmpty(true);
+          else apply(next);
         }}
+        onBlur={(event) => apply(parseNumberStepperInput(event.target.value, min, max) ?? min)}
       />
       <div className="number-stepper-controls">
         <button
@@ -127,23 +129,7 @@ function NumberStepper({ ariaLabel, value, min, max, onChange }: NumberStepperPr
   );
 }
 
-const ABSENT_LOCATIONS = new Set(["ВІДП", "ЛІК", "ВЛК", "НАВЧ", "ВІДР", "Відкомандировані", "СЗЧ", "ПТЗ Новостав"]);
-const SUMMARY_UAV_TYPES = [
-  "Бомбер",
-  "Коптер",
-  "Літаковий Розвідувальний",
-  "Літаковий Ударний",
-  "НРК",
-  "ФПВ",
-  "ФПВ Перехоплювач",
-] as const;
 const TABLE_ZOOM_STEPS = [50, 60, 70, 80, 90, 100, 110, 125] as const;
-function isExternalBlockKind(kind: BlockKind): boolean {
-  return kind === "attached"
-    || kind === "operationalSubordination"
-    || kind === "temporary"
-    || kind === "temporaryActing";
-}
 
 function statusClass(status: string): string {
   if (status === "Працюючий") return "status-working";
@@ -186,18 +172,6 @@ function blockTableClass(kind: BlockKind): string {
   return "block-section";
 }
 
-function sectionForBlock(block: StructureBlock): string {
-  if (block.kind === "companyManagement") return "Управління роти";
-  if (block.kind === "platoonManagement") return "Управління взводу";
-  if (block.kind === "crew") return "Екіпаж";
-  if (block.kind === "attached") return "Прикомандировані";
-  if (block.kind === "operationalSubordination") return "Оперативне підпорядкування";
-  if (block.kind === "temporary") return "Тимчасово прибулі";
-  if (block.kind === "temporaryActing") return "Тимчасові з ТВО";
-  if (block.kind === "unassigned") return "Не розподілені";
-  return block.name.trim() || blockTypeLabel(block.kind);
-}
-
 function BcsColGroup() {
   return (
     <colgroup>
@@ -221,54 +195,35 @@ function BcsColGroup() {
   );
 }
 
-function normalizeLoadedBlocks(value: unknown): StructureBlock[] | null {
-  if (!Array.isArray(value)) return null;
-  const knownKinds = new Set(BLOCK_TYPES.map((item) => item.value));
-  const blocks = value.filter((item): item is Partial<StructureBlock> & { id: string; kind: BlockKind } => {
-    if (!item || typeof item !== "object") return false;
-    const candidate = item as Partial<StructureBlock>;
-    return typeof candidate.id === "string"
-      && typeof candidate.kind === "string"
-      && knownKinds.has(candidate.kind as BlockKind);
-  });
-  if (blocks.length !== value.length || blocks.length === 0) return null;
-  const normalized = blocks.map((block) => ({
-    id: block.id,
-    kind: block.kind,
-    name: normalizeLegacyBlockName(block.kind, typeof block.name === "string" ? block.name : ""),
-    positionName: typeof block.positionName === "string" ? block.positionName : "",
-    slots: typeof block.slots === "number" ? block.slots : 1,
-    status: typeof block.status === "string" && block.status
-      ? block.status
-      : block.kind === "crew" ? CREW_STATUSES[0] : "",
-    uavType: typeof block.uavType === "string" && block.uavType
-      ? block.uavType
-      : block.kind === "crew" ? UAV_TYPES[0] : "",
-    bro: typeof block.bro === "string" ? block.bro : "",
-    workSector: typeof block.workSector === "string" ? block.workSector : "",
-    uavName: typeof block.uavName === "string" ? block.uavName : "",
-    crewActual: typeof block.crewActual === "number"
-      ? block.crewActual
-      : block.kind === "crew" ? normalizedSlots(block.slots ?? 1) : 0,
-  }));
-  return sortBlocksByBcsOrder(withDefaultBlockNames(deduplicateSingletonBlocks(normalized)));
-}
-
 export default function BcsWorkspace({ variant }: Props) {
   const isEditor = variant === "editor";
   const [unitName, setUnitName] = useState("");
   const [reportDate, setReportDate] = useState(tomorrow);
   const [structureType, setStructureType] = useState<StructureType>("company");
   const [authorizedStrength, setAuthorizedStrength] = useState(10);
-  const [blocks, setBlocks] = useState<StructureBlock[]>(createDefaultCompanyBlocks);
+  const [editorData, setEditorData] = useState<BcsEditorData>(() => normalizeEditorData(createDefaultCompanyBlocks(), {}));
+  const { blocks, peopleBySlot, positions, positionByBlock } = editorData;
   const [openBlocks, setOpenBlocks] = useState<Set<string>>(() => new Set());
-  const [peopleBySlot, setPeopleBySlot] = useState<Record<string, PersonInput>>({});
+  const [editorTab, setEditorTab] = useState<"bcs" | "data">("bcs");
+  const [blockToDelete, setBlockToDelete] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [donePath, setDonePath] = useState("");
+  const [notice, setNotice] = useState("");
+  const [importWarnings, setImportWarnings] = useState<string[]>([]);
+  const [pendingImport, setPendingImport] = useState<RestoredWorkspace | null>(null);
+  const [draftLoadBlocked, setDraftLoadBlocked] = useState(false);
   const [draftReady, setDraftReady] = useState(false);
   const [draftStatus, setDraftStatus] = useState<"saved" | "saving" | "error">("saved");
   const [tableZoom, setTableZoom] = useState(80);
+  const saveQueue = useMemo(() => new WorkspaceSaveQueue((payload) =>
+    invoke<void>("save_workspace_draft", { variant, payload }),
+  ), [variant]);
+  const latestDraftPayload = useRef("");
+  const saveGeneration = useRef(0);
+  const closeInProgress = useRef(false);
+  const busyRef = useRef(false);
+  busyRef.current = busy;
 
   const places = useMemo(() => totalSlots(blocks), [blocks]);
   const people = useMemo(() => peopleForExport(blocks, peopleBySlot), [blocks, peopleBySlot]);
@@ -296,95 +251,49 @@ export default function BcsWorkspace({ variant }: Props) {
     ? `Не заповнено місць: ${personValidation.incompleteCount}. Для кожного вкажіть: ${personValidation.missingFields.join(", ")}.`
     : "";
   const exportUnavailableReason = workspaceValidationError || personValidationError;
-  const sheetSummary = useMemo(() => {
-    const populated = blocks.flatMap((block) =>
-      Array.from({ length: normalizedSlots(block.slots) }, (_, index) => ({
-        block,
-        person: peopleBySlot[personKey(block.id, index)] ?? emptyPerson(block.id),
-      })),
-    ).filter(({ person }) => person.fullName.trim());
-    const isOwn = (block: StructureBlock) => !isExternalBlockKind(block.kind);
-    const isTemporaryActing = (block: StructureBlock, person: PersonInput) =>
-      block.kind === "temporaryActing"
-      || (block.kind === "temporary" && upper(person.position).includes("ТВО"));
-    const isTemporary = (block: StructureBlock) =>
-      block.kind === "temporary" || block.kind === "temporaryActing";
-    const countOwnLocation = (location: string) => populated.filter(({ block, person }) =>
-      isOwn(block) && person.location === location,
-    ).length;
-    const countAllLocation = (location: string) => populated.filter(({ person }) => person.location === location).length;
-    const byList = populated.filter(({ block, person }) =>
-      isOwn(block) || isTemporaryActing(block, person),
-    ).length;
-    const present = populated.filter(({ block, person }) =>
-      isOwn(block) && !ABSENT_LOCATIONS.has(person.location),
-    ).length;
-
-    const main: Array<[string, number]> = [
-      ["По штату", authorizedStrength],
-      ["По списку", byList],
-      ["В наявності", present],
-      ["Відпустка", countOwnLocation("ВІДП")],
-      ["Шпиталь", countOwnLocation("ЛІК") + countOwnLocation("ВЛК")],
-      ["Відрядження", countOwnLocation("НАВЧ") + countOwnLocation("ВІДР")],
-      ["Відкомандировані", countOwnLocation("Відкомандировані")],
-      ["Прикомандировані", populated.filter(({ block }) => block.kind === "attached").length],
-      ["Оперативне підпорядкування", populated.filter(({ block }) => block.kind === "operationalSubordination").length],
-      ["ПТЗ Новостав", countOwnLocation("ПТЗ Новостав")],
-      ["СЗЧ", countOwnLocation("СЗЧ")],
-      ["Тимчасово прибулі", populated.filter(({ block }) => isTemporary(block)).length],
-      ["Тимчасово прибулі з ТВО", populated.filter(({ block, person }) => isTemporaryActing(block, person)).length],
-    ];
-
-    const crews = blocks.filter((block) => block.kind === "crew");
-    const uniqueCrewPersonnel = new Set(
-      populated
-        .filter(({ block }) => block.kind === "crew")
-        .map(({ person }) => upper(person.fullName).trim()),
-    ).size;
-    const functional = crewFunctionalSummaryRows(crews, SUMMARY_UAV_TYPES, uniqueCrewPersonnel);
-    const seenSections = new Set<string>();
-    blocks.forEach((block) => {
-      if (block.kind === "crew" || isExternalBlockKind(block.kind)) return;
-      const section = sectionForBlock(block);
-      if (seenSections.has(section)) return;
-      seenSections.add(section);
-      functional.push([
-        section,
-        populated.filter(({ block: candidate, person }) =>
-          sectionForBlock(candidate) === section && !ABSENT_LOCATIONS.has(person.location),
-        ).length,
-      ]);
-    });
-
-    const locations: Array<[string, number]> = LOCATIONS.map((location) => [location, countAllLocation(location)]);
-    locations.push([
-      "Не вказано / інше",
-      populated.filter(({ person }) => !person.location || !LOCATIONS.includes(person.location)).length,
-    ]);
-    locations.push(["Загалом", populated.length]);
-
-    return {
-      main,
-      functional,
-      locations,
-      rowCount: Math.max(main.length, functional.length, locations.length),
-    };
-  }, [authorizedStrength, blocks, peopleBySlot]);
+  const sheetSummary = useMemo(() => buildBcsSheetSummary(authorizedStrength, blocks, peopleBySlot),
+    [authorizedStrength, blocks, peopleBySlot]);
   const tauriAvailable = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const draftPayload = useMemo(() => JSON.stringify({
+    version: 1, unitName, reportDate, structureType, authorizedStrength,
+    blocks, peopleBySlot, positions, positionByBlock, importWarnings,
+  } satisfies WorkspaceDraft), [unitName, reportDate, structureType, authorizedStrength, blocks, peopleBySlot, positions, positionByBlock, importWarnings]);
+  latestDraftPayload.current = draftPayload;
   const notification = error
     ? { kind: "error", text: error }
     : donePath
       ? { kind: "success", text: `Файл збережено: ${donePath}` }
-      : draftStatus === "error"
-        ? { kind: "error", text: "Не вдалося зберегти чернетку." }
-        : null;
+      : notice
+        ? { kind: "success", text: notice }
+        : draftStatus === "error"
+          ? { kind: "error", text: "Не вдалося зберегти чернетку." }
+          : null;
 
   const structureOptions = STRUCTURE_TYPES as ReadonlyArray<CustomSelectOption<StructureType>>;
-  const statusOptions = CREW_STATUSES.map((value) => ({ value, label: value }));
-  const uavOptions = UAV_TYPES.map((value) => ({ value, label: value }));
-  const rankOptions = RANKS.map((value) => ({ value, label: value }));
-  const locationOptions = LOCATIONS.map((value) => ({ value, label: value }));
+  const statusOptions = [
+    ...CREW_STATUSES.map((value) => ({ value, label: value })),
+    ...[...new Set(blocks.map((block) => block.status).filter((value) => value && !CREW_STATUSES.some((status) => status === value)))].map((value) => ({ value, label: `${value} (невідоме значення)`, disabled: true })),
+  ];
+  const uavOptions = [
+    ...UAV_TYPES.map((value) => ({ value, label: value })),
+    ...[...new Set(blocks.map((block) => block.uavType).filter((value) => value && !UAV_TYPES.some((type) => type === value)))].map((value) => ({ value, label: `${value} (невідоме значення)`, disabled: true })),
+  ];
+  const rankOptions = [
+    ...RANKS.map((value) => ({ value, label: value })),
+    ...[...new Set(people.map((person) => person.rank).filter((value) => value && !RANKS.some((rank) => rank === value)))].map((value) => ({ value, label: value, disabled: true })),
+  ];
+  const locationOptions = [
+    ...LOCATIONS.map((value) => ({ value, label: value })),
+    ...[...new Set(people.map((person) => person.location).filter((value) => value && !LOCATIONS.includes(value)))].map((value) => ({ value, label: `${value} (невідоме значення)`, disabled: true })),
+  ];
+  const applyRestoredWorkspace = useCallback(({ draft, data }: RestoredWorkspace) => {
+    setUnitName(draft.unitName);
+    setReportDate(draft.reportDate);
+    setStructureType(draft.structureType);
+    setAuthorizedStrength(draft.authorizedStrength);
+    setEditorData(data);
+    setImportWarnings(draft.importWarnings ?? []);
+  }, []);
 
   function changeTableZoom(direction: -1 | 1) {
     const currentIndex = TABLE_ZOOM_STEPS.findIndex((value) => value === tableZoom);
@@ -406,65 +315,58 @@ export default function BcsWorkspace({ variant }: Props) {
     void invoke<string | null>("load_workspace_draft", { variant })
       .then((payload) => {
         if (disposed || !payload) return;
-        const draft = JSON.parse(payload) as Partial<WorkspaceDraft>;
-        const restoredBlocks = normalizeLoadedBlocks(draft.blocks);
-        if (draft.version !== 1 || !restoredBlocks) return;
-        setUnitName(typeof draft.unitName === "string" ? draft.unitName : "");
-        setReportDate(typeof draft.reportDate === "string" ? draft.reportDate : tomorrow());
-        const restoredStructureType = STRUCTURE_TYPES.some((item) => item.value === draft.structureType)
-          ? draft.structureType as StructureType
-          : "company";
-        setStructureType(restoredStructureType);
-        if (typeof draft.authorizedStrength === "number") setAuthorizedStrength(draft.authorizedStrength);
-        setBlocks(reconcileBlocksForStructure(restoredStructureType, restoredBlocks));
-        if (draft.peopleBySlot && typeof draft.peopleBySlot === "object") {
-          setPeopleBySlot(Object.fromEntries(Object.entries(draft.peopleBySlot).map(([key, person]) => [
-            key,
-            { ...person, fullName: formatFullName(person.fullName ?? "") },
-          ])));
-        }
+        const restored = restoreWorkspaceDraft(JSON.parse(payload));
+        if (!restored) throw new Error("Збережені дані мають невідомий або пошкоджений формат.");
+        applyRestoredWorkspace(restored);
       })
-      .catch(() => setDraftStatus("error"))
+      .catch((cause) => {
+        if (disposed) return;
+        setDraftLoadBlocked(true);
+        setDraftStatus("error");
+        setError(`${messageFrom(cause)} Початкову чернетку збережено без змін.`);
+      })
       .finally(() => {
         if (!disposed) setDraftReady(true);
       });
     return () => {
       disposed = true;
     };
-  }, [tauriAvailable, variant]);
+  }, [tauriAvailable, variant, applyRestoredWorkspace]);
 
   useEffect(() => {
-    if (!tauriAvailable || !draftReady) return;
+    if (!tauriAvailable || !draftReady || draftLoadBlocked) return;
+    const generation = ++saveGeneration.current;
     setDraftStatus("saving");
-    const timeout = window.setTimeout(() => {
-      const draft: WorkspaceDraft = {
-        version: 1,
-        unitName,
-        reportDate,
-        structureType,
-        authorizedStrength,
-        blocks,
-        peopleBySlot,
-      };
-      void invoke("save_workspace_draft", {
-        variant,
-        payload: JSON.stringify(draft),
-      })
-        .then(() => setDraftStatus("saved"))
-        .catch(() => setDraftStatus("error"));
-    }, 250);
-    return () => window.clearTimeout(timeout);
-  }, [
-    authorizedStrength,
-    blocks,
-    draftReady,
-    peopleBySlot,
-    reportDate,
-    structureType,
-    tauriAvailable,
-    unitName,
-    variant,
-  ]);
+    void saveQueue.enqueue(draftPayload)
+      .then(() => { if (generation === saveGeneration.current) setDraftStatus("saved"); })
+      .catch(() => { if (generation === saveGeneration.current) setDraftStatus("error"); });
+  }, [tauriAvailable, draftReady, draftLoadBlocked, draftPayload, saveQueue]);
+
+  useEffect(() => {
+    if (!tauriAvailable) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const appWindow = getCurrentWindow();
+    void appWindow.onCloseRequested((event) => {
+      if (!draftReady || draftLoadBlocked) return;
+      event.preventDefault();
+      if (busyRef.current) return;
+      if (closeInProgress.current) return;
+      closeInProgress.current = true;
+      setBusy(true);
+      void saveQueue.enqueue(latestDraftPayload.current)
+        .then(() => saveQueue.flush())
+        .then(() => appWindow.destroy())
+        .catch((cause) => {
+          closeInProgress.current = false;
+          setBusy(false);
+          setDraftStatus("error");
+          setError(`Зміни ще не збережено. Вікно залишено відкритим: ${messageFrom(cause)}`);
+        });
+    }).then((stop) => { if (disposed) stop(); else unlisten = stop; })
+      .catch((cause) => setError(`Не вдалося ввімкнути збереження перед закриттям: ${messageFrom(cause)}`));
+    return () => { disposed = true; unlisten?.(); };
+  }, [tauriAvailable, draftReady, draftLoadBlocked, saveQueue]);
 
   useEffect(() => {
     if (!donePath) return;
@@ -479,22 +381,17 @@ export default function BcsWorkspace({ variant }: Props) {
   }, [error]);
 
   useEffect(() => {
-    if (draftStatus !== "error") return;
-    const timeout = window.setTimeout(() => setDraftStatus("saved"), 10_000);
+    if (!notice) return;
+    const timeout = window.setTimeout(() => setNotice(""), 10_000);
     return () => window.clearTimeout(timeout);
-  }, [draftStatus]);
+  }, [notice]);
 
   function updateBlock<K extends keyof StructureBlock>(id: string, field: K, value: StructureBlock[K]) {
-    const shouldUppercase = field === "positionName"
-      || field === "bro"
-      || field === "workSector";
-    setBlocks((current) => current.map((block) => {
-      if (block.id !== id) return block;
-      const nextValue = field === "name" && typeof value === "string"
-        ? formatBlockName(block.kind, value)
-        : shouldUppercase && typeof value === "string" ? upper(value) : value;
-      return { ...block, [field]: nextValue };
-    }));
+    try {
+      setEditorData(updateEditorBlock(editorData, id, { [field]: value }));
+    } catch (cause) {
+      setError(messageFrom(cause));
+    }
   }
 
   function updateOfficialSlots(id: string, value: number) {
@@ -507,15 +404,26 @@ export default function BcsWorkspace({ variant }: Props) {
   }
 
   function changeStructureType(value: StructureType) {
+    if (value === "platoon" && blocks.some((block) => block.kind === "companyManagement"
+      && Array.from({ length: normalizedSlots(block.slots) }, (_, index) =>
+        peopleBySlot[personKey(block.id, index)],
+      ).some((person) => person && personHasAnyData(person)))) {
+      setError("Спочатку перенесіть людей з управління роти в інші підрозділи у вкладці «Дані».");
+      return;
+    }
     setStructureType(value);
-    setBlocks((current) => reconcileBlocksForStructure(value, current));
+    setEditorData(normalizeEditorData(
+      reconcileBlocksForStructure(value, blocks), peopleBySlot, positions, positionByBlock,
+    ));
   }
 
   function addBlock(kind: BlockKind) {
     if (isRequiredManagementBlock(structureType, kind)) return;
     if (structureType === "platoon" && kind === "companyManagement") return;
     if (isSingletonBlockKind(kind) && blockExists(kind)) return;
-    setBlocks((current) => sortBlocksByBcsOrder([...current, createBlock(kind)]));
+    setEditorData(normalizeEditorData(
+      sortBlocksByBcsOrder([...blocks, createBlock(kind)]), peopleBySlot, positions, positionByBlock,
+    ));
   }
 
   function changeBlockKind(id: string, kind: BlockKind) {
@@ -528,28 +436,27 @@ export default function BcsWorkspace({ variant }: Props) {
       return;
     }
     setError("");
-    setBlocks((current) => sortBlocksByBcsOrder(current.map((block) => {
-      if (block.id !== id) return block;
-      return {
-        ...block,
+    try {
+      setEditorData(updateEditorBlock(editorData, id, {
         kind,
         name: formatBlockName(kind, defaultBlockName(kind)),
-        status: kind === "crew" ? (block.status || CREW_STATUSES[0]) : "",
-        uavType: kind === "crew" ? (block.uavType || UAV_TYPES[0]) : "",
-        bro: kind === "crew" ? block.bro : "",
-        workSector: kind === "crew" ? block.workSector : "",
-        uavName: kind === "crew" ? block.uavName : "",
-        crewActual: kind === "crew"
-          ? block.kind === "crew" ? block.crewActual : normalizedSlots(block.slots)
-          : 0,
-      };
-    })));
+      }));
+    } catch (cause) {
+      setError(messageFrom(cause));
+    }
   }
 
   function removeBlock(id: string) {
     const currentBlock = blocks.find((block) => block.id === id);
     if (currentBlock && isRequiredManagementBlock(structureType, currentBlock.kind)) return;
-    setBlocks((current) => current.filter((block) => block.id !== id));
+    const hasPeople = currentBlock && Array.from({ length: normalizedSlots(currentBlock.slots) }, (_, index) =>
+      peopleBySlot[personKey(id, index)],
+    ).some((person) => person && personHasAnyData(person));
+    if (hasPeople) {
+      setBlockToDelete(id);
+      return;
+    }
+    setEditorData(removeEditorBlock(editorData, id));
   }
 
   function updatePerson(
@@ -560,10 +467,61 @@ export default function BcsWorkspace({ variant }: Props) {
   ) {
     const key = personKey(blockId, index);
     const nextValue = field === "fullName" ? formatFullName(value) : value;
-    setPeopleBySlot((current) => ({
+    setEditorData((current) => ({
       ...current,
-      [key]: { ...(current[key] ?? emptyPerson(blockId)), [field]: nextValue },
+      peopleBySlot: {
+        ...current.peopleBySlot,
+        [key]: { ...(current.peopleBySlot[key] ?? emptyPerson(blockId)), [field]: nextValue },
+      },
     }));
+  }
+
+  async function applyWorkbookImport(restored: RestoredWorkspace) {
+    setPendingImport(null);
+    setBusy(true);
+    setError("");
+    setDonePath("");
+    try {
+      if (!draftLoadBlocked) {
+        await saveQueue.enqueue(latestDraftPayload.current);
+        await saveQueue.flush();
+      }
+      const backupPath = await invoke<string | null>("backup_workspace_draft", { variant });
+      await saveQueue.enqueue(JSON.stringify(restored.draft));
+      await saveQueue.flush();
+      applyRestoredWorkspace(restored);
+      setDraftLoadBlocked(false);
+      setDraftReady(true);
+      setDraftStatus("saved");
+      setEditorTab("data");
+      setNotice(`Імпортовано: ${totalSlots(restored.data.blocks)} місць, ${restored.data.blocks.length} підрозділів, ${restored.data.positions.length} позицій.${backupPath ? " Попередню чернетку збережено в резервній копії." : ""}`);
+    } catch (cause) {
+      setError(messageFrom(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importWorkbook() {
+    if (!tauriAvailable || busy) return;
+    try {
+      const selected = await open({ title: "Імпортувати БЧС підрозділу", multiple: false,
+        filters: [{ name: "БЧС Excel", extensions: ["xlsx"] }],
+      });
+      if (typeof selected !== "string") return;
+      setBusy(true);
+      setError("");
+      const imported = await invoke<Record<string, unknown>>("import_bcs_editor", { path: selected });
+      const restored = restoreWorkspaceDraft({ ...imported, importWarnings: imported.warnings });
+      if (!restored) throw new Error("Не вдалося відновити структуру імпортованого БЧС.");
+      setBusy(false);
+      const hasCurrentData = unitName.trim() || people.some(personHasAnyData) || positions.length > 0 || draftLoadBlocked;
+      if (hasCurrentData) setPendingImport(restored);
+      else await applyWorkbookImport(restored);
+    } catch (cause) {
+      setError(messageFrom(cause));
+      setBusy(false);
+    }
   }
 
   async function exportWorkbook() {
@@ -607,6 +565,32 @@ export default function BcsWorkspace({ variant }: Props) {
   if (isEditor) {
     return (
       <main className="app-shell workspace-shell editor-sheet-shell">
+        {(busy || !draftReady) && <div className="bcs-working-overlay" role="status"><LoaderCircle className="spin" size={24} /><span>{!draftReady ? "Відкриваю збережені дані…" : "Зберігаю та перевіряю дані…"}</span></div>}
+        {pendingImport && <div className="reason-modal-backdrop" onKeyDown={(event) => { if (event.key === "Escape") setPendingImport(null); }}>
+          <form className="reason-modal" role="dialog" aria-modal="true" aria-labelledby="bcs-import-title" onSubmit={(event) => { event.preventDefault(); void applyWorkbookImport(pendingImport); }}>
+            <h2 id="bcs-import-title">Імпортувати БЧС?</h2>
+            <p>Файл містить {pendingImport.data.blocks.length} підрозділів і {totalSlots(pendingImport.data.blocks)} місць для людей. Поточні дані будуть замінені. Перед заміною програма збереже їхню зашифровану резервну копію.</p>
+            <div className="reason-modal-actions"><button type="button" className="secondary-button" onClick={() => setPendingImport(null)}>Скасувати</button><button autoFocus type="submit" className="primary-button">Імпортувати</button></div>
+          </form>
+        </div>}
+        {blockToDelete && (
+          <div className="reason-modal-backdrop" onKeyDown={(event) => {
+            if (event.key === "Escape") setBlockToDelete(null);
+          }}>
+            <form className="reason-modal" role="dialog" aria-modal="true" aria-labelledby="bcs-delete-title" onSubmit={(event) => {
+              event.preventDefault();
+              setEditorData(removeEditorBlock(editorData, blockToDelete));
+              setBlockToDelete(null);
+            }}>
+              <h2 id="bcs-delete-title">Видалити підрозділ?</h2>
+              <p>Блок «{blocks.find((block) => block.id === blockToDelete)?.name}» і всі заповнені в ньому люди будуть видалені. Щоб зберегти людей, спочатку перенесіть їх у вкладці «Дані».</p>
+              <div className="reason-modal-actions">
+                <button type="button" className="secondary-button" onClick={() => setBlockToDelete(null)}>Скасувати</button>
+                <button autoFocus type="submit" className="primary-button">Видалити</button>
+              </div>
+            </form>
+          </div>
+        )}
         {notification && (
           <div className={`message ${notification.kind}`} role={notification.kind === "error" ? "alert" : "status"}>
             {notification.text}
@@ -614,6 +598,13 @@ export default function BcsWorkspace({ variant }: Props) {
         )}
 
         <section className="workspace-panel bcs-document-panel">
+          <nav className="bcs-editor-tabs" aria-label="Розділи редактора">
+            <button type="button" className={editorTab === "bcs" ? "active" : ""} aria-pressed={editorTab === "bcs"} onClick={() => setEditorTab("bcs")}>БЧС</button>
+            <button type="button" className={editorTab === "data" ? "active" : ""} aria-pressed={editorTab === "data"} onClick={() => setEditorTab("data")}>Дані</button>
+            <button type="button" className="bcs-import-button" disabled={busy || !draftReady || !tauriAvailable} title={!tauriAvailable ? "Для імпорту запустіть програму командою npm run app:editor" : "Заповнити редактор із готового Excel-файла БЧС"} onClick={() => void importWorkbook()}><Upload size={16} /> Імпортувати БЧС</button>
+          </nav>
+          {draftLoadBlocked && <div className="bcs-storage-warning" role="alert">Не вдалося відкрити чернетку. Автозбереження зупинено, щоб зберегти початковий файл. Імпорт іншого БЧС створить його резервну копію.</div>}
+          {importWarnings.length > 0 && <details className="bcs-import-warnings"><summary>Зауваження до імпортованого файла: {importWarnings.length}</summary><ul>{importWarnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></details>}
           <div className="bcs-main-fields">
             <label className="field bcs-unit-field">
               <span>Назва підрозділу</span>
@@ -648,6 +639,16 @@ export default function BcsWorkspace({ variant }: Props) {
             </label>
           </div>
 
+          {editorTab === "data" ? (
+            <BcsDataPanel
+              data={editorData}
+              structureType={structureType}
+              summary={sheetSummary}
+              onChange={setEditorData}
+              onError={setError}
+              onAddBlock={addBlock}
+            />
+          ) : <>
           <div className="bcs-toolbar">
             <strong>Додати блок</strong>
             <div className="add-block-row" aria-label="Додати блок структури">
@@ -789,22 +790,18 @@ export default function BcsWorkspace({ variant }: Props) {
                                 />
                               </td>
                               <td rowSpan={rowCount} className="bcs-block-cell">
-                                {block.kind === "crew" ? (
                                   <input
                                     aria-label="БРО"
                                     value={block.bro}
                                     onChange={(event) => updateBlock(block.id, "bro", event.target.value)}
                                   />
-                                ) : <span className="bcs-empty-value">—</span>}
                               </td>
                               <td rowSpan={rowCount} className="bcs-block-cell">
-                                {block.kind === "crew" ? (
                                   <input
                                     aria-label="Сектор роботи"
                                     value={block.workSector}
                                     onChange={(event) => updateBlock(block.id, "workSector", event.target.value)}
                                   />
-                                ) : <span className="bcs-empty-value">—</span>}
                               </td>
                               <td rowSpan={rowCount} className="bcs-block-cell">
                                 {block.kind === "crew" ? (
@@ -879,7 +876,7 @@ export default function BcsWorkspace({ variant }: Props) {
                           </td>
                           <td className={!person.fullName.trim() ? "bcs-warning-cell" : ""}><input aria-label={`П.І.Б., рядок ${personIndex + 1}`} value={person.fullName} onChange={(event) => updatePerson(block.id, personIndex, "fullName", event.target.value)} /></td>
                           <td><input aria-label={`Функціональні обов'язки, рядок ${personIndex + 1}`} value={person.duties} onChange={(event) => updatePerson(block.id, personIndex, "duties", event.target.value)} /></td>
-                          <td className={!person.location.trim() ? "bcs-warning-cell" : ""}>
+                          <td className={!LOCATIONS.includes(person.location) ? "bcs-warning-cell" : ""}>
                             <CustomSelect
                               ariaLabel={`Де знаходиться, рядок ${personIndex + 1}`}
                               value={person.location}
@@ -941,6 +938,7 @@ export default function BcsWorkspace({ variant }: Props) {
             </table>
             </div>
           </div>
+          </>}
         </section>
 
         <footer className="export-bar">

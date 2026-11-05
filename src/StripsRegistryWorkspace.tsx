@@ -119,12 +119,13 @@ const INITIAL_FILTERS: RegistryFilterState = {
   assignmentState: "",
 };
 const INITIAL_SORTS: RegistrySortStates = {
-  general: { key: "crew", direction: "asc" },
-  crews: { key: "name", direction: "asc" },
-  positions: { key: "name", direction: "asc" },
+  general: { key: "tableOrder", direction: "asc" },
+  crews: { key: "tableOrder", direction: "asc" },
+  positions: { key: "tableOrder", direction: "asc" },
 };
 const TABLE_FILTER_DEBOUNCE_MS = 250;
 const GENERAL_SORT_OPTIONS: ReadonlyArray<CustomSelectOption<RegistryGeneralSortKey>> = [
+  { value: "tableOrder", label: "Порядок таблиці" },
   { value: "crew", label: "Екіпаж" },
   { value: "position", label: "Позиція" },
   { value: "strip", label: "Смуга" },
@@ -135,6 +136,7 @@ const GENERAL_SORT_OPTIONS: ReadonlyArray<CustomSelectOption<RegistryGeneralSort
   { value: "assignmentState", label: "Стан зв’язку" },
 ];
 const CREW_SORT_OPTIONS: ReadonlyArray<CustomSelectOption<RegistryCrewSortKey>> = [
+  { value: "tableOrder", label: "Порядок таблиці" },
   { value: "name", label: "Назва екіпажу" },
   { value: "unit", label: "Підрозділ" },
   { value: "uavType", label: "Тип БпЛА" },
@@ -147,6 +149,7 @@ const CREW_SORT_OPTIONS: ReadonlyArray<CustomSelectOption<RegistryCrewSortKey>> 
   { value: "assignmentState", label: "Стан зв’язку" },
 ];
 const POSITION_SORT_OPTIONS: ReadonlyArray<CustomSelectOption<RegistryPositionSortKey>> = [
+  { value: "tableOrder", label: "Порядок таблиці" },
   { value: "name", label: "Назва позиції" },
   { value: "strip", label: "Смуга" },
   { value: "unit", label: "Підрозділ" },
@@ -845,7 +848,7 @@ export default function StripsRegistryWorkspace() {
     : dataTab === "crews"
       ? CREW_SORT_OPTIONS
       : POSITION_SORT_OPTIONS) as ReadonlyArray<CustomSelectOption<string>>;
-  const activeDefaultSortKey = dataTab === "general" ? "crew" : "name";
+  const activeDefaultSortKey = "tableOrder";
   const activeShownCount = dataTab === "general"
     ? visibleGeneralRows.length
     : dataTab === "crews"

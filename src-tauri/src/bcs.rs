@@ -1,3 +1,4 @@
+use crate::bcs_rules::{is_tvo_position, person_key, validated_kind};
 use crate::xlsx::{self, Cell, SheetRow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,7 @@ struct Schema {
 
 #[derive(Debug, Clone, Default)]
 struct BcsRow {
+    kind: String,
     is_temporary: bool,
     is_external: bool,
     color_key: String,
@@ -72,6 +74,7 @@ struct ParsedBcs {
     date: String,
     is_summary: bool,
     authorized_strength: i64,
+    unit_authorized: BTreeMap<String, i64>,
     rows: Vec<BcsRow>,
 }
 
@@ -150,6 +153,8 @@ pub struct ComparisonResult {
     sections: Vec<ComparisonSection>,
     unit_changes: Vec<String>,
     personnel_changes: Vec<PersonnelChange>,
+    structure_changes: Vec<String>,
+    warnings: Vec<String>,
     has_changes: bool,
 }
 
@@ -276,7 +281,14 @@ fn valid_date(value: &str) -> bool {
     let Ok(year) = parts[2].parse::<u16>() else {
         return false;
     };
-    (1..=31).contains(&day) && (1..=12).contains(&month) && year >= 2000
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    year >= 2000 && (1..=maximum_day).contains(&day)
 }
 
 fn date_from_title(title: &str) -> Option<String> {
@@ -316,9 +328,94 @@ fn is_temporary_section(section: &str) -> bool {
 }
 
 fn is_temporary_acting(row: &BcsRow) -> bool {
-    row.section == "Тимчасові з ТВО"
-        || (row.section == "Тимчасово прибулі"
-            && row.personnel_position.to_uppercase().contains("ТВО"))
+    row_is_kind(row, "temporaryActing")
+        || (row_is_kind(row, "temporary") && is_tvo_position(&row.personnel_position))
+}
+
+fn legacy_kind(section: &str) -> &'static str {
+    match normalize(section).as_str() {
+        "екіпаж" => "crew",
+        "управління роти" => "companyManagement",
+        "управління взводу" | "управління взводів" => {
+            "platoonManagement"
+        }
+        "прикомандировані" => "attached",
+        "оперативне підпорядкування" => "operationalSubordination",
+        "тимчасово прибулі" => "temporary",
+        "тимчасові з тво" => "temporaryActing",
+        "інші" => "custom",
+        "не розподілені" => "unassigned",
+        _ => "department",
+    }
+}
+
+fn effective_kind(row: &BcsRow) -> &str {
+    if row.kind.is_empty() {
+        legacy_kind(&row.section)
+    } else {
+        &row.kind
+    }
+}
+
+fn row_is_kind(row: &BcsRow, kind: &str) -> bool {
+    effective_kind(row) == kind
+}
+fn row_is_crew(row: &BcsRow) -> bool {
+    row_is_kind(row, "crew")
+}
+fn row_is_own(row: &BcsRow) -> bool {
+    !row.is_external
+}
+
+fn kind_is_external(kind: &str) -> bool {
+    matches!(
+        kind,
+        "attached" | "operationalSubordination" | "temporary" | "temporaryActing"
+    )
+}
+
+fn unit_authorized_from_analytics(
+    archive: &mut ZipArchive<File>,
+    total: i64,
+    names: &BTreeSet<String>,
+) -> BTreeMap<String, i64> {
+    let Ok(rows) = xlsx::read_sheet(archive, "Аналітика") else {
+        return BTreeMap::new();
+    };
+    let Some(header) = rows.iter().find(|row| row.number == 5) else {
+        return BTreeMap::new();
+    };
+    if normalize(&cell(header, 0).value) != "підрозділ"
+        || normalize(&cell(header, 1).value) != "по штату"
+    {
+        return BTreeMap::new();
+    }
+    let mut counts = BTreeMap::new();
+    for row in rows.iter().filter(|row| row.number >= 6) {
+        let name = cell(row, 0);
+        let count = cell(row, 1);
+        if name.value.trim().is_empty() {
+            break;
+        }
+        if name.has_formula || count.has_formula {
+            return BTreeMap::new();
+        }
+        let Ok(count) = parse_integer(&count.value, "По штату") else {
+            return BTreeMap::new();
+        };
+        if counts.insert(normalize(&name.value), count).is_some() {
+            return BTreeMap::new();
+        }
+    }
+    if counts.keys().cloned().collect::<BTreeSet<_>>() != *names
+        || counts
+            .values()
+            .try_fold(0i64, |sum, value| sum.checked_add(*value))
+            != Some(total)
+    {
+        return BTreeMap::new();
+    }
+    counts
 }
 
 fn color_key(style: Option<usize>, section: &str, crew_status: &str) -> String {
@@ -452,16 +549,50 @@ fn parse_file(path: &Path) -> Result<ParsedBcs, String> {
     let mut carry = vec![String::new(); 10];
     let mut rows = Vec::new();
     let mut group_number = 0usize;
+    let mut last_body_row_number = 6usize;
+    let has_kind_metadata = cell(header, 19).value == "__BCS_KIND_V1";
+    let footer_start = sheet_rows
+        .iter()
+        .find(|row| {
+            row.number >= 7
+                && (0..4).all(|index| cell(row, index).value.trim().is_empty())
+                && [4, 5]
+                    .iter()
+                    .any(|index| normalize(&cell(row, *index).value).starts_with("бчс"))
+                && normalize(&cell(row, 8).value) == "бчс по функціоналу:"
+                && normalize(&cell(row, 11).value) == "де знаходиться"
+                && [10, 12, 13, 14, 15]
+                    .iter()
+                    .all(|index| cell(row, *index).value.trim().is_empty())
+                && (!has_kind_metadata || cell(row, 19).value.trim().is_empty())
+        })
+        .map(|row| row.number);
+    let body_end = footer_start.and_then(|footer| {
+        sheet_rows
+            .iter()
+            .rev()
+            .find(|row| {
+                row.number < footer
+                    && (0..16).any(|index| !cell(row, index).value.trim().is_empty())
+            })
+            .map(|row| row.number)
+    });
     for (expected_row_number, source) in
         (7usize..).zip(sheet_rows.iter().filter(|row| row.number >= 7))
     {
-        if source.number != expected_row_number {
+        if body_end.is_some_and(|end| source.number > end) {
+            break;
+        }
+        if body_end.is_none() && source.number != expected_row_number {
             break;
         }
         let raw_values = (0..16)
             .map(|index| cell(source, index).value.trim().to_string())
             .collect::<Vec<_>>();
         if raw_values.iter().all(String::is_empty) {
+            if body_end.is_some() {
+                continue;
+            }
             break;
         }
         // Column F in files created by our template generator is a safe COUNTA
@@ -477,7 +608,29 @@ fn parse_file(path: &Path) -> Result<ParsedBcs, String> {
         // Generated templates repeat column A on each physical person row so
         // summary formulas can work without hidden helper columns.  B:J still
         // mark the first row of a logical structure block.
+        let metadata_kind = if has_kind_metadata {
+            let kind = cell(source, 19);
+            if kind.has_formula {
+                return Err(format!(
+                    "«{file_name}»: тип підрозділу у рядку {} не може бути формулою.",
+                    source.number
+                ));
+            }
+            if is_summary && kind.value == "unitHeader" {
+                Some("unitHeader")
+            } else {
+                Some(validated_kind(kind.value.trim()).ok_or_else(|| {
+                    format!(
+                        "«{file_name}»: невідомий тип підрозділу у рядку {}.",
+                        source.number
+                    )
+                })?)
+            }
+        } else {
+            None
+        };
         let starts_group = rows.is_empty()
+            || metadata_kind == Some("unitHeader")
             || raw_values[1..10].iter().any(|value| !value.is_empty())
             || (!raw_values[0].is_empty() && normalize(&raw_values[0]) != normalize(&carry[0]));
         if starts_group {
@@ -499,14 +652,13 @@ fn parse_file(path: &Path) -> Result<ParsedBcs, String> {
         nonnegative_count(&values[6], "Кількість в/с за штатом")?;
         let style = source.cells.iter().find_map(|value| value.style);
         let section = values[0].clone();
+        let kind = metadata_kind.unwrap_or_else(|| legacy_kind(&section));
         let crew_status = values[7].clone();
-        let full_name = values[12].to_uppercase();
+        let full_name = person_key(&values[12]);
         rows.push(BcsRow {
-            is_temporary: is_temporary_section(&section),
-            is_external: matches!(
-                section.as_str(),
-                "Прикомандировані" | "Оперативне підпорядкування"
-            ) || is_temporary_section(&section),
+            kind: kind.to_string(),
+            is_temporary: matches!(kind, "temporary" | "temporaryActing"),
+            is_external: kind_is_external(kind),
             color_key: color_key(style, &section, &crew_status),
             group_key: format!("{}:{group_number}", &id[..16]),
             section,
@@ -526,6 +678,7 @@ fn parse_file(path: &Path) -> Result<ParsedBcs, String> {
             location: values[14].clone(),
             notes: values[15].clone(),
         });
+        last_body_row_number = source.number;
     }
     if rows.is_empty() {
         return Err(format!("«{file_name}»: основна таблиця БЧС порожня."));
@@ -534,13 +687,33 @@ fn parse_file(path: &Path) -> Result<ParsedBcs, String> {
     let authorized_row = sheet_rows
         .iter()
         .find(|row| {
-            row.cells
-                .iter()
-                .any(|value| normalize(&value.value) == "по штату")
+            // A crew name or a personnel field can legitimately contain
+            // "По штату". Only the footer's E:F / legacy F:G table owns it.
+            row.number > footer_start.unwrap_or(last_body_row_number)
+                && [4, 5]
+                    .iter()
+                    .any(|index| normalize(&cell(row, *index).value) == "по штату")
         })
         .ok_or_else(|| format!("«{file_name}»: у підсумку відсутнє значення «По штату»."))?;
     let authorized_strength =
         authorized_strength_from_rows(&sheet_rows, authorized_row, &file_name)?;
+
+    let mut unit_names = BTreeSet::from([normalize(&unit_name)]);
+    for row in &rows {
+        if row.kind == "unitHeader"
+            || (is_summary
+                && row.values()[1..]
+                    .iter()
+                    .all(|value| value.trim().is_empty()))
+        {
+            unit_names.insert(normalize(&row.section));
+        }
+    }
+    let unit_authorized = if is_summary {
+        unit_authorized_from_analytics(&mut archive, authorized_strength, &unit_names)
+    } else {
+        BTreeMap::new()
+    };
 
     Ok(ParsedBcs {
         id,
@@ -550,6 +723,7 @@ fn parse_file(path: &Path) -> Result<ParsedBcs, String> {
         date,
         is_summary,
         authorized_strength,
+        unit_authorized,
         rows,
     })
 }
@@ -596,7 +770,11 @@ fn parse_date_group(
 }
 
 fn parse_collection(paths: &[PathBuf]) -> Result<Vec<ParsedBcs>, String> {
-    parse_date_group(paths, 2, "Оберіть щонайменше два файли БЧС.")
+    let units = parse_date_group(paths, 2, "Оберіть щонайменше два файли БЧС.")?;
+    if units.iter().any(|unit| unit.is_summary) {
+        return Err("Для зведення додавайте лише окремі БЧС підрозділів, а не готовий зведений файл: інакше люди та штат можуть порахуватися двічі. Готові зведення можна завантажувати у вкладку «Порівняння».".into());
+    }
+    Ok(units)
 }
 
 pub fn preview_files(paths: &[PathBuf]) -> Result<ImportPreview, String> {
@@ -634,6 +812,15 @@ pub fn preview_files(paths: &[PathBuf]) -> Result<ImportPreview, String> {
 }
 
 pub fn export_request(request: ExportRequest) -> Result<String, String> {
+    let output = PathBuf::from(&request.output_path);
+    if output
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| !value.eq_ignore_ascii_case("xlsx"))
+        .unwrap_or(true)
+    {
+        return Err("Файл зведення повинен мати розширення .xlsx.".into());
+    }
     let paths = request.paths.iter().map(PathBuf::from).collect::<Vec<_>>();
     let parsed = parse_collection(&paths)?;
     if parsed.len() != request.unit_order.len() {
@@ -654,15 +841,6 @@ pub fn export_request(request: ExportRequest) -> Result<String, String> {
         return Err("Порядок підрозділів не містить усіх файлів.".into());
     }
 
-    let output = PathBuf::from(&request.output_path);
-    if output
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| !value.eq_ignore_ascii_case("xlsx"))
-        .unwrap_or(true)
-    {
-        return Err("Файл зведення повинен мати розширення .xlsx.".into());
-    }
     if paths.iter().any(|input| input == &output) {
         return Err("Не можна перезаписати один із вхідних файлів.".into());
     }
@@ -670,13 +848,41 @@ pub fn export_request(request: ExportRequest) -> Result<String, String> {
     Ok(output.to_string_lossy().into_owned())
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ComparisonPerson {
+    name: String,
     unit_name: String,
+    kind: String,
     section: String,
     rank: String,
     position: String,
     location: String,
+    crew_name: String,
+    position_name: String,
+    battle_order: String,
+    sector: String,
+    uav_name: String,
+    uav_type: String,
+    crew_status: String,
+    crew_actual: String,
+    crew_official: String,
+    duties: String,
+    notes: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComparisonStructure {
+    unit_name: String,
+    kind: String,
+    name: String,
+    position_name: String,
+    battle_order: String,
+    sector: String,
+    uav_name: String,
+    uav_type: String,
+    crew_status: String,
+    crew_actual: String,
+    crew_official: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -688,8 +894,10 @@ struct ComparisonSnapshot {
     absences: BTreeMap<String, i64>,
     crews: BTreeMap<String, i64>,
     locations: BTreeMap<String, i64>,
-    people: BTreeMap<String, ComparisonPerson>,
+    people: BTreeMap<String, Vec<ComparisonPerson>>,
+    structures: BTreeMap<String, Vec<ComparisonStructure>>,
     units: BTreeMap<String, ComparisonUnitSnapshot>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -709,104 +917,88 @@ fn metric(label: impl Into<String>, before: i64, after: i64) -> ComparisonMetric
     }
 }
 
+fn is_unit_heading(row: &BcsRow) -> bool {
+    !row.section.trim().is_empty()
+        && row.values()[1..]
+            .iter()
+            .all(|value| value.trim().is_empty())
+}
+
 fn snapshot(units: &[ParsedBcs], locations: &[String]) -> Result<ComparisonSnapshot, String> {
     let mut result = ComparisonSnapshot::default();
     let configured_locations = locations.iter().cloned().collect::<HashSet<_>>();
-
     for unit in units {
         result.authorized = result
             .authorized
             .checked_add(unit.authorized_strength)
             .ok_or_else(|| "Сума штатної чисельності завелика.".to_string())?;
-
         let personnel = unit
             .rows
             .iter()
             .filter(|row| !row.full_name.trim().is_empty())
             .collect::<Vec<_>>();
         let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
-        let temporary_acting = personnel
+        let acting = personnel
             .iter()
             .filter(|row| is_temporary_acting(row))
             .count() as i64;
-        let listed = own
-            .checked_add(temporary_acting)
+        result.listed += own
+            .checked_add(acting)
             .ok_or_else(|| "Чисельність підрозділу завелика.".to_string())?;
-        let present = personnel
+        result.present += personnel
             .iter()
             .filter(|row| !row.is_external && !ABSENT_LOCATIONS.contains(&row.location.as_str()))
             .count() as i64;
-
-        result.listed += listed;
-        result.present += present;
         result.total_personnel += personnel.len() as i64;
-        if unit.is_summary {
-            let mut grouped = BTreeMap::<String, Vec<&BcsRow>>::new();
-            let mut current_unit_name = String::new();
-            for row in &unit.rows {
-                if !row.section.trim().is_empty()
-                    && row.values()[1..]
-                        .iter()
-                        .all(|value| value.trim().is_empty())
-                {
-                    current_unit_name = row.section.clone();
-                    continue;
-                }
-                if !current_unit_name.is_empty() {
-                    grouped
-                        .entry(current_unit_name.clone())
-                        .or_default()
-                        .push(row);
-                }
-            }
-            for (name, rows) in grouped {
-                let personnel = rows
-                    .into_iter()
-                    .filter(|row| !row.full_name.trim().is_empty())
-                    .collect::<Vec<_>>();
-                let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
-                let temporary_acting = personnel
-                    .iter()
-                    .filter(|row| is_temporary_acting(row))
-                    .count() as i64;
-                let present = personnel
-                    .iter()
-                    .filter(|row| {
-                        !row.is_external && !ABSENT_LOCATIONS.contains(&row.location.as_str())
-                    })
-                    .count() as i64;
-                result.units.insert(
-                    normalize(&name),
-                    ComparisonUnitSnapshot {
-                        name,
-                        authorized: None,
-                        listed: own + temporary_acting,
-                        present,
-                    },
-                );
-            }
-        } else {
-            result.units.insert(
-                normalize(&unit.unit_name),
-                ComparisonUnitSnapshot {
-                    name: unit.unit_name.clone(),
-                    authorized: Some(unit.authorized_strength),
-                    listed,
-                    present,
-                },
-            );
-        }
 
+        // A6 (the first unit heading) is outside ParsedBcs.rows. Start with that
+        // unit rather than dropping its records until the second unit heading.
         let mut current_unit_name = unit.unit_name.clone();
+        let mut grouped = BTreeMap::<String, Vec<&BcsRow>>::new();
+        grouped.entry(current_unit_name.clone()).or_default();
+        let mut previous_group: Option<&str> = None;
         for row in &unit.rows {
-            if unit.is_summary
-                && !row.section.trim().is_empty()
-                && row.values()[1..]
-                    .iter()
-                    .all(|value| value.trim().is_empty())
-            {
+            if unit.is_summary && is_unit_heading(row) {
                 current_unit_name = row.section.clone();
+                grouped.entry(current_unit_name.clone()).or_default();
+                previous_group = None;
                 continue;
+            }
+            grouped
+                .entry(current_unit_name.clone())
+                .or_default()
+                .push(row);
+            if previous_group != Some(row.group_key.as_str()) {
+                previous_group = Some(row.group_key.as_str());
+                let kind = effective_kind(row).to_string();
+                let name = if row_is_crew(row) {
+                    row.crew_name.clone()
+                } else {
+                    row.section.clone()
+                };
+                let key = format!(
+                    "{}\u{1f}{}\u{1f}{}",
+                    normalize(&current_unit_name),
+                    kind,
+                    normalize(&name)
+                );
+                result
+                    .structures
+                    .entry(key)
+                    .or_default()
+                    .push(ComparisonStructure {
+                        unit_name: current_unit_name.clone(),
+                        kind,
+                        name,
+                        position_name: row.position_name.clone(),
+                        battle_order: row.battle_order.clone(),
+                        sector: row.sector.clone(),
+                        uav_name: row.uav_name.clone(),
+                        uav_type: row.uav_type.clone(),
+                        crew_status: row.crew_status.clone(),
+                        crew_actual: row.crew_actual.clone(),
+                        crew_official: row.crew_official.clone(),
+                    });
             }
             if row.full_name.trim().is_empty() {
                 continue;
@@ -819,76 +1011,119 @@ fn snapshot(units: &[ParsedBcs], locations: &[String]) -> Result<ComparisonSnaps
             *result.locations.entry(location).or_default() += 1;
             result
                 .people
-                .entry(normalize(&row.full_name))
-                .or_insert_with(|| ComparisonPerson {
+                .entry(crate::bcs_rules::person_key(&row.full_name))
+                .or_default()
+                .push(ComparisonPerson {
+                    name: row.full_name.clone(),
                     unit_name: current_unit_name.clone(),
+                    kind: effective_kind(row).to_string(),
                     section: row.section.clone(),
                     rank: row.rank.clone(),
                     position: row.personnel_position.clone(),
                     location: row.location.clone(),
+                    crew_name: row.crew_name.clone(),
+                    position_name: row.position_name.clone(),
+                    battle_order: row.battle_order.clone(),
+                    sector: row.sector.clone(),
+                    uav_name: row.uav_name.clone(),
+                    uav_type: row.uav_type.clone(),
+                    crew_status: row.crew_status.clone(),
+                    crew_actual: row.crew_actual.clone(),
+                    crew_official: row.crew_official.clone(),
+                    duties: row.duties.clone(),
+                    notes: row.notes.clone(),
                 });
+        }
+        for (name, rows) in grouped {
+            let personnel = rows
+                .into_iter()
+                .filter(|row| !row.full_name.trim().is_empty())
+                .collect::<Vec<_>>();
+            let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
+            let acting = personnel
+                .iter()
+                .filter(|row| is_temporary_acting(row))
+                .count() as i64;
+            let present = personnel
+                .iter()
+                .filter(|row| {
+                    !row.is_external && !ABSENT_LOCATIONS.contains(&row.location.as_str())
+                })
+                .count() as i64;
+            let authorized = if unit.is_summary {
+                unit.unit_authorized.get(&normalize(&name)).copied()
+            } else {
+                Some(unit.authorized_strength)
+            };
+            result.units.insert(
+                normalize(&name),
+                ComparisonUnitSnapshot {
+                    name,
+                    authorized,
+                    listed: own + acting,
+                    present,
+                },
+            );
+        }
+        if unit.is_summary
+            && (unit.unit_authorized.is_empty()
+                || result
+                    .units
+                    .values()
+                    .any(|entry| entry.authorized.is_none()))
+        {
+            result.warnings.push(format!("«{}»: у готовому зведенні немає перевіреної штатної чисельності кожного підрозділу. Загальний штат порівняно, але зміни його розподілу між підрозділами можуть бути недоступні. Для повної перевірки додайте окремі БЧС підрозділів за обидві дати.", unit.file_name));
         }
     }
 
-    let all_personnel = units
+    let all = units
         .iter()
         .flat_map(|unit| &unit.rows)
         .filter(|row| !row.full_name.trim().is_empty())
         .collect::<Vec<_>>();
-    let count_own_location = |location: &str| {
-        all_personnel
-            .iter()
+    let own_at = |location: &str| {
+        all.iter()
             .filter(|row| !row.is_external && row.location == location)
             .count() as i64
     };
-    let temporary_acting = all_personnel
-        .iter()
-        .filter(|row| is_temporary_acting(row))
-        .count() as i64;
     for (label, count) in [
-        ("Відпустка", count_own_location("ВІДП")),
-        (
-            "Шпиталь",
-            count_own_location("ЛІК") + count_own_location("ВЛК"),
-        ),
-        (
-            "Відрядження",
-            count_own_location("НАВЧ") + count_own_location("ВІДР"),
-        ),
-        ("Відкомандировані", count_own_location("Відкомандировані")),
+        ("Відпустка", own_at("ВІДП")),
+        ("Шпиталь", own_at("ЛІК") + own_at("ВЛК")),
+        ("Відрядження", own_at("НАВЧ") + own_at("ВІДР")),
+        ("Відкомандировані", own_at("Відкомандировані")),
         (
             "Прикомандировані",
-            all_personnel
-                .iter()
-                .filter(|row| row.section == "Прикомандировані")
+            all.iter()
+                .filter(|row| row_is_kind(row, "attached"))
                 .count() as i64,
         ),
         (
             "Оперативне підпорядкування",
-            all_personnel
-                .iter()
-                .filter(|row| row.section == "Оперативне підпорядкування")
+            all.iter()
+                .filter(|row| row_is_kind(row, "operationalSubordination"))
                 .count() as i64,
         ),
-        ("ПТЗ Новостав", count_own_location("ПТЗ Новостав")),
-        ("СЗЧ", count_own_location("СЗЧ")),
+        ("ПТЗ Новостав", own_at("ПТЗ Новостав")),
+        ("СЗЧ", own_at("СЗЧ")),
         (
             "Тимчасово прибулі",
-            all_personnel.iter().filter(|row| row.is_temporary).count() as i64,
+            all.iter().filter(|row| row.is_temporary).count() as i64,
         ),
-        ("Тимчасово прибулі з ТВО", temporary_acting),
+        (
+            "Тимчасово прибулі з ТВО",
+            all.iter().filter(|row| is_temporary_acting(row)).count() as i64,
+        ),
     ] {
         result.absences.insert(label.into(), count);
     }
-
-    let crew_starts = crew_group_starts(units)
+    let crews = crew_group_starts(units)
         .into_iter()
-        .filter(|row| row.section == "Екіпаж" && !row.crew_name.trim().is_empty())
+        .filter(|row| row_is_crew(row) && !row.crew_name.trim().is_empty())
         .collect::<Vec<_>>();
-    let crew_personnel = all_personnel
+    let crew_personnel = all
         .iter()
-        .filter(|row| row.section == "Екіпаж")
-        .map(|row| normalize(&row.full_name))
+        .filter(|row| row_is_crew(row))
+        .map(|row| crate::bcs_rules::person_key(&row.full_name))
         .collect::<HashSet<_>>()
         .len() as i64;
     result
@@ -896,7 +1131,7 @@ fn snapshot(units: &[ParsedBcs], locations: &[String]) -> Result<ComparisonSnaps
         .insert("Особового складу в екіпажах".into(), crew_personnel);
     result
         .crews
-        .insert("Екіпажів загалом".into(), crew_starts.len() as i64);
+        .insert("Екіпажів загалом".into(), crews.len() as i64);
     for (label, group) in [
         ("Формуються", "forming"),
         ("Працюючі", "working"),
@@ -904,13 +1139,13 @@ fn snapshot(units: &[ParsedBcs], locations: &[String]) -> Result<ComparisonSnaps
     ] {
         result.crews.insert(
             label.into(),
-            crew_starts
+            crews
                 .iter()
                 .filter(|row| crew_status_group(&row.crew_status) == group)
                 .count() as i64,
         );
     }
-    for crew in crew_starts {
+    for crew in crews {
         let kind = crew.uav_type.trim();
         if !kind.is_empty() {
             *result
@@ -919,7 +1154,6 @@ fn snapshot(units: &[ParsedBcs], locations: &[String]) -> Result<ComparisonSnaps
                 .or_default() += 1;
         }
     }
-
     Ok(result)
 }
 
@@ -957,14 +1191,209 @@ fn delta_phrase(label: &str, before: i64, after: i64) -> Option<String> {
     }
 }
 
+fn changed_text(label: &str, before: &str, after: &str) -> Option<String> {
+    (before != after).then(|| {
+        format!(
+            "{label}: {} → {}",
+            if before.is_empty() {
+                "не вказано"
+            } else {
+                before
+            },
+            if after.is_empty() {
+                "не вказано"
+            } else {
+                after
+            }
+        )
+    })
+}
+
+fn remove_unchanged<'a, T: PartialEq>(
+    before: Vec<&'a T>,
+    after: Vec<&'a T>,
+) -> (Vec<&'a T>, Vec<&'a T>) {
+    let mut matched_after = vec![false; after.len()];
+    let mut unmatched_before = Vec::new();
+    for previous in before {
+        if let Some((index, _)) = after
+            .iter()
+            .enumerate()
+            .find(|(index, current)| !matched_after[*index] && **current == previous)
+        {
+            matched_after[index] = true;
+        } else {
+            unmatched_before.push(previous);
+        }
+    }
+    (
+        unmatched_before,
+        after
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, current)| (!matched_after[index]).then_some(current))
+            .collect(),
+    )
+}
+
+fn comparison_kind_label(kind: &str) -> &str {
+    match kind {
+        "crew" => "Екіпаж",
+        "companyManagement" => "Управління роти",
+        "platoonManagement" => "Управління взводу",
+        "department" => "Відділення",
+        "informationDepartment" => "Відділення збору та обробки інформації",
+        "independent" => "Окремий підрозділ",
+        "custom" => "Інші",
+        "attached" => "Прикомандировані",
+        "operationalSubordination" => "Оперативне підпорядкування",
+        "temporary" => "Тимчасово прибулі",
+        "temporaryActing" => "Тимчасові з ТВО",
+        "unassigned" => "Не розподілені",
+        _ => "Блок",
+    }
+}
+
+fn person_change_details(previous: &ComparisonPerson, current: &ComparisonPerson) -> Vec<String> {
+    let mut changes = Vec::new();
+    if normalize(&previous.unit_name) != normalize(&current.unit_name) {
+        changes.push(format!(
+            "Підрозділ: {} → {}",
+            previous.unit_name, current.unit_name
+        ));
+    }
+    if let Some(change) = changed_text(
+        "Тип блоку",
+        comparison_kind_label(&previous.kind),
+        comparison_kind_label(&current.kind),
+    ) {
+        changes.push(change);
+    }
+    for (label, before, after) in [
+        ("Блок", &previous.section, &current.section),
+        ("Звання", &previous.rank, &current.rank),
+        ("Посада", &previous.position, &current.position),
+        ("Де знаходиться", &previous.location, &current.location),
+        ("Екіпаж", &previous.crew_name, &current.crew_name),
+        (
+            "Назва позиції",
+            &previous.position_name,
+            &current.position_name,
+        ),
+        ("БРО", &previous.battle_order, &current.battle_order),
+        ("Сектор роботи", &previous.sector, &current.sector),
+        ("Назва БпАК", &previous.uav_name, &current.uav_name),
+        ("Тип БпАК", &previous.uav_type, &current.uav_type),
+        (
+            "Статус екіпажу",
+            &previous.crew_status,
+            &current.crew_status,
+        ),
+        (
+            "Фактично в/с в екіпажі",
+            &previous.crew_actual,
+            &current.crew_actual,
+        ),
+        (
+            "Кількість в/с",
+            &previous.crew_official,
+            &current.crew_official,
+        ),
+        ("Обов’язки", &previous.duties, &current.duties),
+        ("Примітка", &previous.notes, &current.notes),
+    ] {
+        if let Some(change) = changed_text(label, before, after) {
+            changes.push(change);
+        }
+    }
+    changes
+}
+
 fn comparison_personnel_changes(
     before: &ComparisonSnapshot,
     after: &ComparisonSnapshot,
-) -> Vec<PersonnelChange> {
+) -> (Vec<PersonnelChange>, Vec<String>) {
     let mut changes = Vec::new();
-    for (key, person) in &after.people {
-        if !before.people.contains_key(key) {
-            let details = format!(
+    let mut warnings = Vec::new();
+    let mut add_pair = |previous: &ComparisonPerson, current: &ComparisonPerson| {
+        let details = person_change_details(previous, current);
+        if !details.is_empty() {
+            changes.push(PersonnelChange {
+                kind: "changed".into(),
+                person_name: current.name.to_uppercase(),
+                details: format!("{}: {}", current.unit_name, details.join("; ")),
+            });
+        }
+    };
+    let mut additions = Vec::new();
+    let mut removals = Vec::new();
+    for key in before
+        .people
+        .keys()
+        .chain(after.people.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+    {
+        let previous = before
+            .people
+            .get(&key)
+            .map_or_else(Vec::new, |people| people.iter().collect());
+        let current = after
+            .people
+            .get(&key)
+            .map_or_else(Vec::new, |people| people.iter().collect());
+        let (previous, current) = remove_unchanged(previous, current);
+        let mut matched_previous = HashSet::new();
+        let mut matched_current = HashSet::new();
+        let unit_keys = previous
+            .iter()
+            .map(|person| normalize(&person.unit_name))
+            .chain(current.iter().map(|person| normalize(&person.unit_name)))
+            .collect::<BTreeSet<_>>();
+        // Match contextual names in the same unit first. Never let the first
+        // homonym in another unit erase a later record.
+        for unit_key in unit_keys {
+            let old = previous
+                .iter()
+                .enumerate()
+                .filter(|(_, person)| normalize(&person.unit_name) == unit_key)
+                .collect::<Vec<_>>();
+            let new = current
+                .iter()
+                .enumerate()
+                .filter(|(_, person)| normalize(&person.unit_name) == unit_key)
+                .collect::<Vec<_>>();
+            if old.len() == 1 && new.len() == 1 {
+                add_pair(old[0].1, new[0].1);
+                matched_previous.insert(old[0].0);
+                matched_current.insert(new[0].0);
+            }
+        }
+        let previous = previous
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, person)| (!matched_previous.contains(&index)).then_some(person))
+            .collect::<Vec<_>>();
+        let current = current
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, person)| (!matched_current.contains(&index)).then_some(person))
+            .collect::<Vec<_>>();
+        if previous.len() == 1 && current.len() == 1 {
+            add_pair(previous[0], current[0]);
+        } else if previous.is_empty() {
+            additions.extend(current);
+        } else if current.is_empty() {
+            removals.extend(previous);
+        } else {
+            warnings.push(format!("Неоднозначний ПІБ «{}»: залишилося {} записів за першу дату й {} за другу. Без унікального ідентифікатора не можна достовірно визначити персональні зміни; записи не об’єднано і не відкинуто.", key.to_uppercase(), previous.len(), current.len()));
+        }
+    }
+    for person in additions {
+        changes.push(PersonnelChange {
+            kind: "added".into(),
+            person_name: person.name.to_uppercase(),
+            details: format!(
                 "Додано: {} · {} · {}",
                 person.unit_name,
                 if person.rank.is_empty() {
@@ -977,73 +1406,117 @@ fn comparison_personnel_changes(
                 } else {
                     &person.location
                 }
-            );
-            changes.push(PersonnelChange {
-                kind: "added".into(),
-                person_name: key.to_uppercase(),
-                details,
-            });
-        }
+            ),
+        });
     }
-    for (key, person) in &before.people {
-        if !after.people.contains_key(key) {
-            changes.push(PersonnelChange {
-                kind: "removed".into(),
-                person_name: key.to_uppercase(),
-                details: format!("Вибув: {} · {}", person.unit_name, person.location),
-            });
-        }
-    }
-    for (key, previous) in &before.people {
-        let Some(current) = after.people.get(key) else {
-            continue;
-        };
-        let mut details = Vec::new();
-        if previous.unit_name != current.unit_name {
-            details.push(format!(
-                "Підрозділ: {} → {}",
-                previous.unit_name, current.unit_name
-            ));
-        }
-        if previous.location != current.location {
-            let from = if previous.location.is_empty() {
-                "не вказано"
-            } else {
-                &previous.location
-            };
-            let to = if current.location.is_empty() {
-                "не вказано"
-            } else {
-                &current.location
-            };
-            details.push(format!("Де знаходиться: {from} → {to}"));
-        }
-        if previous.section != current.section {
-            details.push(format!("Блок: {} → {}", previous.section, current.section));
-        }
-        if previous.rank != current.rank {
-            details.push(format!("Звання: {} → {}", previous.rank, current.rank));
-        }
-        if previous.position != current.position {
-            details.push(format!(
-                "Посада: {} → {}",
-                previous.position, current.position
-            ));
-        }
-        if !details.is_empty() {
-            changes.push(PersonnelChange {
-                kind: "changed".into(),
-                person_name: key.to_uppercase(),
-                details: details.join("; "),
-            });
-        }
+    for person in removals {
+        changes.push(PersonnelChange {
+            kind: "removed".into(),
+            person_name: person.name.to_uppercase(),
+            details: format!("Вибув: {} · {}", person.unit_name, person.location),
+        });
     }
     changes.sort_by(|left, right| {
         left.kind
             .cmp(&right.kind)
             .then(left.person_name.cmp(&right.person_name))
+            .then(left.details.cmp(&right.details))
     });
-    changes
+    (changes, warnings)
+}
+
+fn structure_change_details(
+    previous: &ComparisonStructure,
+    current: &ComparisonStructure,
+) -> Vec<String> {
+    [
+        (
+            "Назва позиції",
+            &previous.position_name,
+            &current.position_name,
+        ),
+        ("БРО", &previous.battle_order, &current.battle_order),
+        ("Сектор роботи", &previous.sector, &current.sector),
+        ("Назва БпАК", &previous.uav_name, &current.uav_name),
+        ("Тип БпАК", &previous.uav_type, &current.uav_type),
+        (
+            "Статус екіпажу",
+            &previous.crew_status,
+            &current.crew_status,
+        ),
+        (
+            "Фактично в/с в екіпажі",
+            &previous.crew_actual,
+            &current.crew_actual,
+        ),
+        (
+            "Кількість в/с",
+            &previous.crew_official,
+            &current.crew_official,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, before, after)| changed_text(label, before, after))
+    .collect()
+}
+
+fn comparison_structure_changes(
+    before: &ComparisonSnapshot,
+    after: &ComparisonSnapshot,
+) -> (Vec<String>, Vec<String>) {
+    let mut changes = Vec::new();
+    let mut warnings = Vec::new();
+    for key in before
+        .structures
+        .keys()
+        .chain(after.structures.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+    {
+        let previous = before
+            .structures
+            .get(&key)
+            .map_or_else(Vec::new, |rows| rows.iter().collect());
+        let current = after
+            .structures
+            .get(&key)
+            .map_or_else(Vec::new, |rows| rows.iter().collect());
+        let (previous, current) = remove_unchanged(previous, current);
+        if previous.len() == 1 && current.len() == 1 {
+            let details = structure_change_details(previous[0], current[0]);
+            if !details.is_empty() {
+                changes.push(format!(
+                    "{} · {} «{}»: {}.",
+                    current[0].unit_name,
+                    comparison_kind_label(&current[0].kind),
+                    current[0].name,
+                    details.join("; ")
+                ));
+            }
+        } else if previous.is_empty() {
+            for row in current {
+                changes.push(format!(
+                    "Додано {} «{}» у підрозділі «{}».",
+                    comparison_kind_label(&row.kind).to_lowercase(),
+                    row.name,
+                    row.unit_name
+                ));
+            }
+        } else if current.is_empty() {
+            for row in previous {
+                changes.push(format!(
+                    "Вилучено {} «{}» з підрозділу «{}».",
+                    comparison_kind_label(&row.kind).to_lowercase(),
+                    row.name,
+                    row.unit_name
+                ));
+            }
+        } else {
+            let row = current[0];
+            warnings.push(format!("Неоднозначні блоки «{}» у підрозділі «{}»: {} за першу дату, {} за другу. Їхні записи збережено окремо; перевірте назви блоків.", row.name, row.unit_name, previous.len(), current.len()));
+        }
+    }
+    (changes, warnings)
 }
 
 fn compare_parsed(before: &[ParsedBcs], after: &[ParsedBcs]) -> Result<ComparisonResult, String> {
@@ -1062,18 +1535,14 @@ fn compare_parsed(before: &[ParsedBcs], after: &[ParsedBcs]) -> Result<Compariso
     }
     let single_unit = before.len() == 1 && after.len() == 1 && !before_summary;
     if single_unit && normalize(&before[0].unit_name) != normalize(&after[0].unit_name) {
-        return Err(format!(
-            "Для порівняння одного підрозділу оберіть той самий підрозділ за обидві дати: «{}» і «{}» не збігаються.",
-            before[0].unit_name, after[0].unit_name
-        ));
+        return Err(format!("Для порівняння одного підрозділу оберіть той самий підрозділ за обидві дати: «{}» і «{}» не збігаються.", before[0].unit_name, after[0].unit_name));
     }
-    let duplicate = before
+    if before
         .iter()
-        .any(|left| after.iter().any(|right| left.id == right.id));
-    if duplicate {
+        .any(|left| after.iter().any(|right| left.id == right.id))
+    {
         return Err("Один і той самий файл не можна використати для обох дат.".into());
     }
-
     let schema = schema()?;
     let previous = snapshot(before, &schema.locations)?;
     let current = snapshot(after, &schema.locations)?;
@@ -1094,7 +1563,6 @@ fn compare_parsed(before: &[ParsedBcs], after: &[ParsedBcs]) -> Result<Compariso
     if highlights.is_empty() {
         highlights.push("Основні показники не змінилися.".into());
     }
-
     let sections = [
         (
             "Причини відсутності",
@@ -1114,7 +1582,6 @@ fn compare_parsed(before: &[ParsedBcs], after: &[ParsedBcs]) -> Result<Compariso
         })
     })
     .collect::<Vec<_>>();
-
     let mut unit_changes = Vec::new();
     for key in previous
         .units
@@ -1159,31 +1626,41 @@ fn compare_parsed(before: &[ParsedBcs], after: &[ParsedBcs]) -> Result<Compariso
             (None, None) => {}
         }
     }
-
-    let personnel_changes = comparison_personnel_changes(&previous, &current);
-    let headline_changed = headline.iter().any(|row| row.delta != 0);
-    let has_changes = headline_changed
+    let (personnel_changes, person_warnings) = comparison_personnel_changes(&previous, &current);
+    let (structure_changes, structure_warnings) = comparison_structure_changes(&previous, &current);
+    let mut warnings = previous
+        .warnings
+        .iter()
+        .chain(&current.warnings)
+        .cloned()
+        .chain(person_warnings)
+        .chain(structure_warnings)
+        .collect::<Vec<_>>();
+    warnings.sort();
+    warnings.dedup();
+    let has_changes = headline.iter().any(|row| row.delta != 0)
         || !sections.is_empty()
         || !unit_changes.is_empty()
-        || !personnel_changes.is_empty();
-    let title = if single_unit {
-        before[0].unit_name.clone()
-    } else {
-        "Загальний БЧС".into()
-    };
-
+        || !personnel_changes.is_empty()
+        || !structure_changes.is_empty();
     Ok(ComparisonResult {
         scope: if single_unit { "unit" } else { "general" }.into(),
-        title,
+        title: if single_unit {
+            before[0].unit_name.clone()
+        } else {
+            "Загальний БЧС".into()
+        },
         before_date: before[0].date.clone(),
         after_date: after[0].date.clone(),
-        before_unit_count: before.len(),
-        after_unit_count: after.len(),
+        before_unit_count: previous.units.len(),
+        after_unit_count: current.units.len(),
         highlights,
         headline,
         sections,
         unit_changes,
         personnel_changes,
+        structure_changes,
+        warnings,
         has_changes,
     })
 }
@@ -1343,7 +1820,7 @@ fn analytics_data(units: &[ParsedBcs], locations: &[String]) -> Result<Analytics
 
     let crews = crew_group_starts(units)
         .into_iter()
-        .filter(|row| row.section == "Екіпаж" && !row.crew_name.trim().is_empty())
+        .filter(|row| row_is_crew(row) && !row.crew_name.trim().is_empty())
         .collect::<Vec<_>>();
     let crew_statuses = [
         ("Формуються", "forming"),
@@ -1466,9 +1943,10 @@ fn write_unit_rows(
     widths: &[f64],
 ) -> Result<(), String> {
     sheet.push_str(&format!(
-        "<row r=\"{}\" ht=\"20\" customHeight=\"1\">{}</row>",
+        "<row r=\"{}\" ht=\"20\" customHeight=\"1\">{}{}</row>",
         *cursor,
-        text_cell(0, *cursor, &unit.unit_name, 6)
+        text_cell(0, *cursor, &unit.unit_name, 6),
+        text_cell(19, *cursor, "unitHeader", 0)
     ));
     merges.push(format!("A{}:P{}", *cursor, *cursor));
     *cursor += 1;
@@ -1507,6 +1985,7 @@ fn write_unit_rows(
                     sheet.push_str(&text_cell(index, current, value, style));
                 }
             }
+            sheet.push_str(&text_cell(19, current, effective_kind(row), 0));
             sheet.push_str("</row>");
         }
         *cursor += end - start;
@@ -1883,7 +2362,9 @@ fn chart_xml(spec: &ChartSpec, chart_index: usize) -> String {
                 .iter()
                 .enumerate()
                 .map(|(point, value)| {
-                    format!("<c:pt idx=\"{point}\"><c:v>{value:.4}</c:v></c:pt>")
+                    // Match the precision stored in the analytics table, so
+                    // refreshing a chart cannot change its displayed values.
+                    format!("<c:pt idx=\"{point}\"><c:v>{value:.1}</c:v></c:pt>")
                 })
                 .collect::<String>();
             format!(
@@ -1905,9 +2386,9 @@ fn chart_xml(spec: &ChartSpec, chart_index: usize) -> String {
     let category_position = if spec.horizontal { "l" } else { "b" };
     let value_position = if spec.horizontal { "b" } else { "l" };
     let maximum = if spec.percent_axis {
-        "<c:max val=\"100\"/>"
+        format!("<c:max val=\"{}\"/>", percent_chart_maximum(spec))
     } else {
-        ""
+        String::new()
     };
     let major_unit = chart_major_unit(spec);
     let legend = if spec.series.len() > 1 {
@@ -1921,9 +2402,19 @@ fn chart_xml(spec: &ChartSpec, chart_index: usize) -> String {
     )
 }
 
+fn percent_chart_maximum(spec: &ChartSpec) -> u64 {
+    let largest = spec
+        .series
+        .iter()
+        .flat_map(|series| series.values.iter().copied())
+        .filter(|value| value.is_finite())
+        .fold(100.0_f64, f64::max);
+    ((largest / 50.0).ceil() * 50.0) as u64
+}
+
 fn chart_major_unit(spec: &ChartSpec) -> u64 {
     if spec.percent_axis {
-        return 10;
+        return percent_chart_maximum(spec).div_ceil(10).max(10);
     }
 
     let maximum_value = spec
@@ -1975,6 +2466,8 @@ fn write_summary_package(
     styles: &str,
     theme: &str,
 ) -> Result<(), String> {
+    xlsx::validate_export_sheet_size(bcs_sheet)?;
+    xlsx::validate_export_sheet_size(analytics_sheet)?;
     let file = File::create(path).map_err(|_| "Не вдалося створити Excel-файл.".to_string())?;
     let mut archive = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
@@ -2054,7 +2547,7 @@ fn export_workbook(path: &Path, units: &[ParsedBcs]) -> Result<(), String> {
             index + 1
         ));
     }
-    sheet.push_str("</cols><sheetData><row r=\"1\" ht=\"18\" customHeight=\"1\">");
+    sheet.push_str("<col min=\"20\" max=\"20\" width=\"0\" hidden=\"1\" customWidth=\"1\"/></cols><sheetData><row r=\"1\" ht=\"18\" customHeight=\"1\">");
     sheet.push_str(&text_cell(
         0,
         1,
@@ -2066,6 +2559,7 @@ fn export_workbook(path: &Path, units: &[ParsedBcs]) -> Result<(), String> {
         sheet.push_str(&text_cell(index, 4, header, 3));
         merges.push(format!("{}4:{}5", column(index), column(index)));
     }
+    sheet.push_str(&text_cell(19, 4, "__BCS_KIND_V1", 0));
     sheet.push_str("</row><row r=\"5\" ht=\"30\" customHeight=\"1\">");
     for index in 0..schema.headers.len() {
         sheet.push_str(&text_cell(index, 5, "", 3));
@@ -2111,7 +2605,7 @@ fn write_summary(
         .copied()
         .filter(|row| !row.full_name.trim().is_empty())
         .collect::<Vec<_>>();
-    let own = personnel.iter().filter(|row| !row.is_external).count() as i64;
+    let own = personnel.iter().filter(|row| row_is_own(row)).count() as i64;
     let count_own_location = |location: &str| {
         personnel
             .iter()
@@ -2162,11 +2656,11 @@ fn write_summary(
         count_own_location("Відкомандировані"),
         personnel
             .iter()
-            .filter(|row| row.section == "Прикомандировані")
+            .filter(|row| row_is_kind(row, "attached"))
             .count() as i64,
         personnel
             .iter()
-            .filter(|row| row.section == "Оперативне підпорядкування")
+            .filter(|row| row_is_kind(row, "operationalSubordination"))
             .count() as i64,
         count_own_location("ПТЗ Новостав"),
         count_own_location("СЗЧ"),
@@ -2176,12 +2670,12 @@ fn write_summary(
 
     let crews = crew_group_starts(units)
         .into_iter()
-        .filter(|row| row.section == "Екіпаж" && !row.crew_name.is_empty())
+        .filter(|row| row_is_crew(row) && !row.crew_name.is_empty())
         .collect::<Vec<_>>();
     let crew_personnel = personnel
         .iter()
-        .filter(|row| row.section == "Екіпаж")
-        .map(|row| row.full_name.to_uppercase())
+        .filter(|row| row_is_crew(row))
+        .map(|row| person_key(&row.full_name))
         .collect::<HashSet<_>>()
         .len() as i64;
     let mut functional = vec![
@@ -2219,7 +2713,8 @@ fn write_summary(
     for row in &rows {
         if !row.is_external
             && !row.section.is_empty()
-            && row.section != "Екіпаж"
+            && !row_is_crew(row)
+            && effective_kind(row) != "unitHeader"
             && !sections.contains(&row.section)
         {
             sections.push(row.section.clone());
@@ -2231,7 +2726,9 @@ fn write_summary(
             personnel
                 .iter()
                 .filter(|row| {
-                    row.section == section
+                    row_is_own(row)
+                        && !row_is_crew(row)
+                        && row.section == section
                         && !ABSENT_LOCATIONS.contains(&row.location.as_str())
                         && row.location != "ПТЗ Новостав"
                 })
@@ -2286,6 +2783,14 @@ fn write_summary(
 }
 
 #[cfg(test)]
+#[path = "bcs_comparison_tests.rs"]
+mod comparison_regression_tests;
+
+#[cfg(test)]
+#[path = "bcs_calculation_tests.rs"]
+mod calculation_regression_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read;
@@ -2299,6 +2804,7 @@ mod tests {
             date: date.into(),
             is_summary: false,
             authorized_strength: authorized,
+            unit_authorized: BTreeMap::new(),
             rows: vec![BcsRow {
                 color_key: "crew-working".into(),
                 group_key: format!("group-{unit}"),
@@ -2626,10 +3132,17 @@ mod tests {
                 .delta,
             1
         );
-        assert!(result
+        let unit_change = result
             .unit_changes
             .iter()
-            .any(|change| change.contains("ПІДРОЗДІЛ Б: по списку 1 → 2")));
+            .find(|change| change.starts_with("ПІДРОЗДІЛ Б:"))
+            .expect("changed unit must be identified independently of field order");
+        assert!(unit_change.contains("по штату 3 → 4"), "{unit_change}");
+        assert!(unit_change.contains("по списку 1 → 2"), "{unit_change}");
+        assert!(unit_change.contains("в наявності 1 → 2"), "{unit_change}");
+        assert_eq!(result.unit_changes.len(), 1);
+        assert_eq!((result.before_unit_count, result.after_unit_count), (2, 2));
+        assert!(result.warnings.is_empty());
     }
 
     #[test]

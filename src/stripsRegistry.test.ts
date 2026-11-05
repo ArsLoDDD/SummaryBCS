@@ -230,6 +230,56 @@ describe("strips registry", () => {
     expect(report.strips[0].groups[0].positions[0].crews[0].name).toBe("СОКІЛ-1");
   });
 
+  it("orders report groups by UAV type, operational unit priority, and stable source order", () => {
+    const data = createEmptyStripsRegistry("2026-10-14");
+    const plan = [
+      ["Рота НРК", "Бомбер"],
+      ["Саперний взвод", "ФПВ"],
+      ["10 РУБАК", "ФПВ"],
+      ["РУБАК", "ФПВ"],
+      ["2 РУБАК", "ФПВ"],
+      ["2 РБАК", "ФПВ"],
+      ["РБАК", "ФПВ"],
+      ["1 РУБАК", "ФПВ"],
+      ["Рота НРК", "ФПВ"],
+      ["1 РУБАК", "Бомбер"],
+      ["РУБАК", "Бомбер"],
+      ["Рота забезпечення", "Бомбер"],
+    ] as const;
+    data.positions = plan.map(([unit, uavType], index) => ({
+      ...createRegistryPosition(),
+      id: `ordered-position-${index + 1}`,
+      sourceOrder: 100 - index,
+      name: `ПОЗИЦІЯ ${index + 1}`,
+      strip: "Смуга ТЕСТ",
+      unit,
+      uavType,
+      readiness: "БГ",
+      bro: `БРО-${index + 1}`,
+      area: "ТЕСТОВИЙ РАЙОН",
+      direction: "Тестовий напрямок",
+    }));
+    const sourcePositionIds = data.positions.map((position) => position.id);
+
+    const report = registryToStripsReport(data);
+
+    expect(report.strips[0].groups.map((group) => [group.uavType, group.unit])).toEqual([
+      ["ФПВ", "РБАК"],
+      ["ФПВ", "РУБАК"],
+      ["ФПВ", "1 РУБАК"],
+      ["ФПВ", "2 РБАК"],
+      ["ФПВ", "2 РУБАК"],
+      ["ФПВ", "10 РУБАК"],
+      ["ФПВ", "Рота НРК"],
+      ["ФПВ", "Саперний взвод"],
+      ["Бомбер", "РУБАК"],
+      ["Бомбер", "1 РУБАК"],
+      ["Бомбер", "Рота забезпечення"],
+      ["Бомбер", "Рота НРК"],
+    ]);
+    expect(data.positions.map((position) => position.id)).toEqual(sourcePositionIds);
+  });
+
   it("moves a crew by changing only its assignment", () => {
     const data = validRegistry();
     const second = {
@@ -329,8 +379,12 @@ describe("strips registry", () => {
 
   it("normalizes a saved encrypted draft without changing its links", () => {
     const data = validRegistry();
+    data.crews[0].sourceOrder = 8;
+    data.positions[0].sourceOrder = 3;
     const restored = normalizeStripsRegistry(JSON.parse(JSON.stringify(data)));
     expect(restored).toEqual(data);
+    expect(restored?.crews[0].sourceOrder).toBe(8);
+    expect(restored?.positions[0].sourceOrder).toBe(3);
   });
 
   it("migrates a version 1 draft without keeping the old crew strip field", () => {

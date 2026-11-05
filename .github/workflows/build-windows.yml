@@ -185,6 +185,8 @@ jobs:
           Remove-Item -LiteralPath $probeDirectory -Recurse -Force
       - name: Зібрати програму ${{ matrix.app }}
         run: ${{ matrix.compile_command }}
+      - name: Перевірити EXE без консольного вікна
+        run: node scripts/check-windows-signing.mjs --exe "src-tauri/target/release/${{ matrix.binary_name }}.exe"
       - name: Підписати програму ${{ matrix.app }}
         shell: pwsh
         run: |
@@ -227,6 +229,10 @@ jobs:
           )
           $thumbprints = @()
           foreach ($file in $signedFiles) {
+            & node "scripts/check-windows-signing.mjs" --exe $file.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "EXE не пройшов перевірку Windows GUI без CMD: $($file.Name)"
+            }
             $signature = Get-AuthenticodeSignature -FilePath $file.FullName
             $selfSignedStatusAllowed = $env:WINDOWS_SIGNING_MODE -eq "self-signed" -and ($signature.Status.ToString() -in @("NotTrusted", "UnknownError"))
             if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -and -not $selfSignedStatusAllowed) {

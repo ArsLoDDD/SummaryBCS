@@ -1,4 +1,7 @@
-use crate::xlsx;
+use crate::{
+    bcs_rules::{is_tvo_position, person_key, tvo_delimiters},
+    xlsx,
+};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -98,6 +101,23 @@ pub enum BlockKind {
     Unassigned,
     #[serde(rename = "custom", alias = "other")]
     Custom,
+}
+
+fn kind_code(kind: BlockKind) -> &'static str {
+    match kind {
+        BlockKind::CompanyManagement => "companyManagement",
+        BlockKind::PlatoonManagement => "platoonManagement",
+        BlockKind::Crew => "crew",
+        BlockKind::Department => "department",
+        BlockKind::InformationDepartment => "informationDepartment",
+        BlockKind::Independent => "independent",
+        BlockKind::Attached => "attached",
+        BlockKind::OperationalSubordination => "operationalSubordination",
+        BlockKind::Temporary => "temporary",
+        BlockKind::TemporaryActing => "temporaryActing",
+        BlockKind::Unassigned => "unassigned",
+        BlockKind::Custom => "custom",
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,7 +261,8 @@ fn validate_text(
     max_chars: usize,
     required: bool,
 ) -> Result<String, String> {
-    let value = value.trim();
+    let value =
+        value.trim_matches(|character: char| character.is_whitespace() || character == '\u{feff}');
     if required && value.is_empty() {
         return Err(format!("Поле «{label}» обов’язкове."));
     }
@@ -440,14 +461,12 @@ fn prepare(
         } else {
             (String::new(), String::new())
         };
-        let (bro, work_sector, uav_name) = if block.kind == BlockKind::Crew {
-            (
-                validate_text(&block.bro, "БРО екіпажу", 200, false)?,
-                validate_text(&block.work_sector, "Сектор роботи екіпажу", 200, false)?,
-                validate_text(&block.uav_name, "Назва БпАК екіпажу", 250, false)?,
-            )
+        let bro = validate_text(&block.bro, "БРО позиції", 200, false)?;
+        let work_sector = validate_text(&block.work_sector, "Сектор роботи позиції", 200, false)?;
+        let uav_name = if block.kind == BlockKind::Crew {
+            validate_text(&block.uav_name, "Назва БпАК екіпажу", 250, false)?
         } else {
-            (String::new(), String::new(), String::new())
+            String::new()
         };
         let crew_actual = if block.kind == BlockKind::Crew {
             if block.crew_actual > 2_000 {
@@ -494,7 +513,8 @@ fn prepare(
         person.block_id = block_id;
         person.position = validate_text(&person.position, "Посада", 250, false)?;
         person.rank = validate_text(&person.rank, "Військове звання", 100, false)?;
-        person.full_name = validate_text(&person.full_name, "П.І.Б.", 250, false)?;
+        person.full_name =
+            format_full_name(&validate_text(&person.full_name, "П.І.Б.", 250, false)?);
         person.duties = validate_text(&person.duties, "Функціональні обов’язки", 1_000, false)?;
         person.location = validate_text(&person.location, "Де знаходиться", 200, false)?;
         if !person.location.is_empty() {
@@ -596,6 +616,9 @@ fn column(index: usize) -> char {
 }
 
 fn text_cell(column_index: usize, row: usize, value: &str, style: usize) -> String {
+    if value.is_empty() {
+        return format!("<c r=\"{}{row}\" s=\"{style}\"/>", column(column_index));
+    }
     format!(
         "<c r=\"{}{row}\" s=\"{style}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{}</t></is></c>",
         column(column_index),
@@ -621,6 +644,93 @@ fn formula_cell(
         "<c r=\"{}{row}\" s=\"{style}\"><f>{}</f><v>{cached}</v></c>",
         column(column_index),
         esc(formula)
+    )
+}
+
+enum FormulaCache<'a> {
+    Number(i64),
+    Text(&'a str),
+}
+
+fn shared_formula_cell(
+    column_index: usize,
+    row: usize,
+    formula: &str,
+    data_end: usize,
+    shared_id: usize,
+    cached: FormulaCache<'_>,
+) -> String {
+    let column = column(column_index);
+    let node = if row == 7 {
+        format!(
+            "<f t=\"shared\" si=\"{shared_id}\" ref=\"{column}7:{column}{data_end}\">{}</f>",
+            esc(formula)
+        )
+    } else {
+        format!("<f t=\"shared\" si=\"{shared_id}\"/>")
+    };
+    let (kind, value) = match cached {
+        FormulaCache::Number(value) => ("", value.to_string()),
+        FormulaCache::Text(value) => (" t=\"str\"", esc(value)),
+    };
+    format!("<c r=\"{column}{row}\" s=\"0\"{kind}>{node}<v>{value}</v></c>")
+}
+
+fn normalize_tvo_spaces(value: &str) -> String {
+    value
+        .to_uppercase()
+        .chars()
+        .map(|character| {
+            if character.is_whitespace() || character == '\u{feff}' {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn whitespace_formula(source: &str) -> String {
+    let mut spaces = format!("UPPER({source})");
+    for delimiter in tvo_delimiters()
+        .chars()
+        .filter(|value| *value != ' ' && (value.is_whitespace() || *value == '\u{feff}'))
+    {
+        let code = delimiter as u32;
+        let character = if code < 32 {
+            format!("CHAR({code})")
+        } else {
+            format!("_xlfn.UNICHAR({code})")
+        };
+        spaces = format!("SUBSTITUTE({spaces},{character},\" \")");
+    }
+    spaces
+}
+
+fn temporary_acting_formulas(row: usize) -> (String, String) {
+    let spaces = whitespace_formula(&format!("$K{row}"));
+    let mut punctuation = format!("$V{row}");
+    for delimiter in tvo_delimiters().chars() {
+        if !delimiter.is_whitespace() && delimiter != '\u{feff}' {
+            punctuation = format!(
+                "SUBSTITUTE({punctuation},\"{}\",\" \")",
+                formula_text(&delimiter.to_string())
+            );
+        }
+    }
+    (
+        spaces,
+        format!("IF(ISNUMBER(SEARCH(\" ТВО \",\" \"&{punctuation}&\" \")),1,0)"),
+    )
+}
+
+fn literal_criterion(value: &str) -> String {
+    format!(
+        "={}",
+        value
+            .replace('~', "~~")
+            .replace('*', "~*")
+            .replace('?', "~?")
     )
 }
 
@@ -694,7 +804,7 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
             index + 1
         ));
     }
-    sheet.push_str("<col min=\"17\" max=\"19\" width=\"0\" hidden=\"1\" customWidth=\"1\"/></cols><sheetData><row r=\"1\" ht=\"18\" customHeight=\"1\">");
+    sheet.push_str("<col min=\"17\" max=\"23\" width=\"0\" hidden=\"1\" customWidth=\"1\"/></cols><sheetData><row r=\"1\" ht=\"18\" customHeight=\"1\">");
     sheet.push_str(&text_cell(
         0,
         1,
@@ -709,6 +819,7 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
         sheet.push_str(&text_cell(index, 4, header, 3));
         merges.push(format!("{}4:{}5", column(index), column(index)));
     }
+    sheet.push_str(&text_cell(19, 4, "__BCS_KIND_V1", 0));
     sheet.push_str("</row><row r=\"5\" ht=\"30\" customHeight=\"1\">");
     for index in 0..schema.headers.len() {
         sheet.push_str(&text_cell(index, 5, "", 3));
@@ -721,6 +832,11 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
 
     let mut crew_validation_cells = Vec::new();
     let mut seen_crew_people = HashSet::new();
+    let unique_formula = "IF(AND($T7=\"crew\",$W7<>\"\"),IF(COUNTIFS($T$7:$T7,\"crew\",$W$7:$W7,\"=\"&SUBSTITUTE(SUBSTITUTE(SUBSTITUTE($W7,\"~\",\"~~\"),\"*\",\"~*\"),\"?\",\"~?\"))=1,1,0),0)";
+    let (normalized_position_formula, acting_token_formula) = temporary_acting_formulas(7);
+    let acting_formula =
+        format!("IF($T7=\"temporaryActing\",1,IF($T7=\"temporary\",{acting_token_formula},0))");
+    let canonical_name_formula = format!("TRIM({})", whitespace_formula("$M7"));
     for block in &request.blocks {
         let style = style_for(block);
         if block.slots > 1 {
@@ -797,16 +913,14 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
             // desktop Excel while still preventing duplicate P.I.B. counts.
             let unique_crew_person = block.kind == BlockKind::Crew
                 && !person.full_name.is_empty()
-                && seen_crew_people.insert(person.full_name.to_uppercase());
-            let unique_formula = format!(
-                "IF(AND($Q{row}=\"Екіпаж\",$M{row}<>\"\"),IF(COUNTIFS($Q$7:$Q{row},\"Екіпаж\",$M$7:$M{row},$M{row})=1,1,0),0)"
-            );
-            sheet.push_str(&formula_cell(
+                && seen_crew_people.insert(person_key(&person.full_name));
+            sheet.push_str(&shared_formula_cell(
                 17,
                 row,
-                &unique_formula,
-                i64::from(unique_crew_person),
+                unique_formula,
+                data_end,
                 0,
+                FormulaCache::Number(i64::from(unique_crew_person)),
             ));
             // S is a stable crew-header marker. It is 1 exactly once per crew,
             // so exported crew totals never depend on merged visible cells.
@@ -815,6 +929,36 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
                 row,
                 i64::from(block.kind == BlockKind::Crew && offset == 0),
                 0,
+            ));
+            // Semantic category is independent of its editable display name.
+            sheet.push_str(&text_cell(19, row, kind_code(block.kind), 0));
+            let acting = block.kind == BlockKind::TemporaryActing
+                || (block.kind == BlockKind::Temporary && is_tvo_position(&person.position));
+            sheet.push_str(&shared_formula_cell(
+                20,
+                row,
+                &acting_formula,
+                data_end,
+                1,
+                FormulaCache::Number(i64::from(acting)),
+            ));
+            // Shared formulas keep large workbooks small; splitting text
+            // normalization keeps each formula below Excel's nesting limit.
+            sheet.push_str(&shared_formula_cell(
+                21,
+                row,
+                &normalized_position_formula,
+                data_end,
+                2,
+                FormulaCache::Text(&normalize_tvo_spaces(&person.position)),
+            ));
+            sheet.push_str(&shared_formula_cell(
+                22,
+                row,
+                &canonical_name_formula,
+                data_end,
+                3,
+                FormulaCache::Text(&person_key(&person.full_name)),
             ));
             sheet.push_str("</row>");
         }
@@ -835,7 +979,7 @@ fn build_bcs_sheet(request: &PreparedRequest, schema: &Schema) -> Result<String,
     let format_range = format!("A7:P{data_end}");
     let lookup = "IFERROR(LOOKUP(2,1/($H$7:$H7&lt;&gt;&quot;&quot;),$H$7:$H7),&quot;&quot;)";
     sheet.push_str(&format!(
-        "<conditionalFormatting sqref=\"{format_range}\"><cfRule type=\"expression\" dxfId=\"8\" priority=\"1\"><formula>AND($Q7=&quot;Екіпаж&quot;,{lookup}=&quot;Працюючий&quot;)</formula></cfRule><cfRule type=\"expression\" dxfId=\"4\" priority=\"2\"><formula>AND($Q7=&quot;Екіпаж&quot;,{lookup}=&quot;Формується&quot;)</formula></cfRule><cfRule type=\"expression\" dxfId=\"9\" priority=\"3\"><formula>AND($Q7=&quot;Екіпаж&quot;,{lookup}=&quot;Не активний&quot;)</formula></cfRule></conditionalFormatting>"
+        "<conditionalFormatting sqref=\"{format_range}\"><cfRule type=\"expression\" dxfId=\"8\" priority=\"1\"><formula>AND($T7=&quot;crew&quot;,{lookup}=&quot;Працюючий&quot;)</formula></cfRule><cfRule type=\"expression\" dxfId=\"4\" priority=\"2\"><formula>AND($T7=&quot;crew&quot;,{lookup}=&quot;Формується&quot;)</formula></cfRule><cfRule type=\"expression\" dxfId=\"9\" priority=\"3\"><formula>AND($T7=&quot;crew&quot;,{lookup}=&quot;Не активний&quot;)</formula></cfRule></conditionalFormatting>"
     ));
 
     let h_cells = crew_validation_cells
@@ -914,7 +1058,7 @@ fn inline_data_validation<'a>(
 }
 
 fn countifs_formula(data_end: usize, extra_pairs: &[(&str, &str)], exclude_absent: bool) -> String {
-    let mut formula = format!("COUNTIFS($M$7:$M${data_end},\"<>\"");
+    let mut formula = format!("COUNTIFS($W$7:$W${data_end},\"?*\"");
     for (column, criterion) in extra_pairs {
         formula.push_str(&format!(
             ",$${column}$$7:$${column}$${data_end},\"{}\"",
@@ -952,7 +1096,7 @@ fn capitalize_name_part(value: &str) -> String {
             capitalize_next = false;
         } else {
             result.push(character);
-            capitalize_next = matches!(character, '-' | '\'' | '’' | '.');
+            capitalize_next = matches!(character, '-' | '.');
         }
     }
     result
@@ -974,7 +1118,8 @@ fn capitalize_first_letter(value: &str) -> String {
 
 fn format_full_name(value: &str) -> String {
     value
-        .split_whitespace()
+        .split(|character: char| character.is_whitespace() || character == '\u{feff}')
+        .filter(|part| !part.is_empty())
         .enumerate()
         .map(|(index, part)| {
             if index == 0 {
@@ -1041,8 +1186,7 @@ fn write_summary(
         .collect::<Vec<_>>();
     let temp_acting = |block: &&PreparedBlock, person: &&PersonInput| {
         block.kind == BlockKind::TemporaryActing
-            || (block.kind == BlockKind::Temporary
-                && person.position.to_uppercase().contains("ТВО"))
+            || (block.kind == BlockKind::Temporary && is_tvo_position(&person.position))
     };
     let is_temporary = |block: &&PreparedBlock| {
         matches!(
@@ -1077,34 +1221,26 @@ fn write_summary(
     let own_normal_formula = countifs_formula(
         data_end,
         &[
-            ("Q", "<>Прикомандировані"),
-            ("Q", "<>Оперативне підпорядкування"),
-            ("Q", "<>Тимчасово прибулі"),
-            ("Q", "<>Тимчасові з ТВО"),
+            ("T", "<>attached"),
+            ("T", "<>operationalSubordination"),
+            ("T", "<>temporary"),
+            ("T", "<>temporaryActing"),
         ],
         false,
     );
-    let temp_acting_formula = format!(
-        "{}+{}",
-        countifs_formula(data_end, &[("Q", "Тимчасові з ТВО")], false),
-        countifs_formula(
-            data_end,
-            &[("Q", "Тимчасово прибулі"), ("K", "*ТВО*")],
-            false,
-        )
-    );
+    let temp_acting_formula = format!("SUMIFS($U$7:$U${data_end},$W$7:$W${data_end},\"?*\")");
     let temporary_formula = format!(
         "{}+{}",
-        countifs_formula(data_end, &[("Q", "Тимчасово прибулі")], false),
-        countifs_formula(data_end, &[("Q", "Тимчасові з ТВО")], false),
+        countifs_formula(data_end, &[("T", "temporary")], false),
+        countifs_formula(data_end, &[("T", "temporaryActing")], false),
     );
     let present_normal_formula = countifs_formula(
         data_end,
         &[
-            ("Q", "<>Прикомандировані"),
-            ("Q", "<>Оперативне підпорядкування"),
-            ("Q", "<>Тимчасово прибулі"),
-            ("Q", "<>Тимчасові з ТВО"),
+            ("T", "<>attached"),
+            ("T", "<>operationalSubordination"),
+            ("T", "<>temporary"),
+            ("T", "<>temporaryActing"),
         ],
         true,
     );
@@ -1113,10 +1249,10 @@ fn write_summary(
             data_end,
             &[
                 ("O", location),
-                ("Q", "<>Прикомандировані"),
-                ("Q", "<>Оперативне підпорядкування"),
-                ("Q", "<>Тимчасово прибулі"),
-                ("Q", "<>Тимчасові з ТВО"),
+                ("T", "<>attached"),
+                ("T", "<>operationalSubordination"),
+                ("T", "<>temporary"),
+                ("T", "<>temporaryActing"),
             ],
             false,
         )
@@ -1167,11 +1303,7 @@ fn write_summary(
         ),
         (
             "Прикомандировані".to_string(),
-            Some(countifs_formula(
-                data_end,
-                &[("Q", "Прикомандировані")],
-                false,
-            )),
+            Some(countifs_formula(data_end, &[("T", "attached")], false)),
             all_people
                 .iter()
                 .filter(|(block, _)| block.kind == BlockKind::Attached)
@@ -1181,7 +1313,7 @@ fn write_summary(
             "Оперативне підпорядкування".to_string(),
             Some(countifs_formula(
                 data_end,
-                &[("Q", "Оперативне підпорядкування")],
+                &[("T", "operationalSubordination")],
                 false,
             )),
             all_people
@@ -1220,7 +1352,7 @@ fn write_summary(
     let unique_crew_personnel = all_people
         .iter()
         .filter(|(block, _)| block.kind == BlockKind::Crew)
-        .map(|(_, person)| person.full_name.to_uppercase())
+        .map(|(_, person)| person_key(&person.full_name))
         .collect::<HashSet<_>>()
         .len() as i64;
     let crew_personnel_formula = crew_personnel_formula(data_end);
@@ -1302,11 +1434,24 @@ fn write_summary(
         }
         functional.push((
             block.section.clone(),
-            countifs_formula(data_end, &[("Q", &block.section)], true),
+            countifs_formula(
+                data_end,
+                &[
+                    ("Q", &literal_criterion(&block.section)),
+                    ("T", "<>crew"),
+                    ("T", "<>attached"),
+                    ("T", "<>operationalSubordination"),
+                    ("T", "<>temporary"),
+                    ("T", "<>temporaryActing"),
+                ],
+                true,
+            ),
             all_people
                 .iter()
                 .filter(|(candidate, person)| {
-                    candidate.section == block.section
+                    candidate.kind != BlockKind::Crew
+                        && !is_external_kind(candidate.kind)
+                        && candidate.section == block.section
                         && !ABSENT_LOCATIONS.contains(&person.location.as_str())
                 })
                 .count() as i64,
@@ -1361,7 +1506,7 @@ fn write_summary(
                 .map(|location| countifs_formula(data_end, &[("O", location)], false))
                 .collect::<Vec<_>>()
                 .join("+");
-            let formula = format!("COUNTIF($M$7:$M${data_end},\"<>\")-({known_total})");
+            let formula = format!("COUNTIF($W$7:$W${data_end},\"?*\")-({known_total})");
             sheet.push_str(&text_cell(11, row, "Не вказано / інше", 3));
             sheet.push_str(&formula_cell(12, row, &formula, cached, 3));
         } else if index == schema.locations.len() + 1 {
@@ -1369,7 +1514,7 @@ fn write_summary(
             sheet.push_str(&formula_cell(
                 12,
                 row,
-                &format!("COUNTIF($M$7:$M${data_end},\"<>\")"),
+                &format!("COUNTIF($W$7:$W${data_end},\"?*\")"),
                 all_people.len() as i64,
                 3,
             ));
@@ -1378,6 +1523,10 @@ fn write_summary(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "generator_calculation_tests.rs"]
+mod calculation_regression_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1519,9 +1668,9 @@ mod tests {
         assert!(!sheet.contains("COUNTA(M9:M11)"));
         assert!(sheet.contains("<c r=\"F7\" s=\"171\"><v>4</v></c>"));
         assert!(sheet.contains("SUM($R$7:$R$11)"));
-        assert!(sheet.contains("COUNTIFS($Q$7:$Q7,&quot;Екіпаж&quot;,$M$7:$M7,$M7)"));
+        assert!(sheet.contains("COUNTIFS($T$7:$T7,&quot;crew&quot;,$W$7:$W7"));
         assert!(sheet.contains("Оперативне підпорядкування"));
-        assert!(sheet.contains("$K$7:$K$11,&quot;*ТВО*&quot;"));
+        assert!(sheet.contains("SUMIFS($U$7:$U$11,$W$7:$W$11,&quot;?*&quot;)"));
         assert!(sheet.contains("ЕКІПАЖ АЛЬФА"));
         assert!(sheet.contains("ПОЗИЦІЯ АЛЬФА"));
         assert!(sheet.contains("БРО-1"));
@@ -1536,11 +1685,11 @@ mod tests {
         assert!(styles.contains("<fgColor rgb=\"FFFDEADA\"/><bgColor rgb=\"FFFDEADA\"/>"));
         assert!(!styles.contains("<fgColor rgb=\"FFD7E48D\"/><bgColor rgb=\"FF000000\"/>"));
         assert!(!sheet.contains("ТЕСТОВИЙ ПІДРОЗДІЛ (Рота)"));
-        assert!(sheet.contains("<col min=\"17\" max=\"19\" width=\"0\" hidden=\"1\""));
+        assert!(sheet.contains("<col min=\"17\" max=\"23\" width=\"0\" hidden=\"1\""));
         assert!(sheet.contains("<mergeCell ref=\"A7:A9\"/>"));
         assert!(sheet.contains("<c r=\"A8\" s=\"171\""));
         assert!(sheet.contains("<c r=\"J9\" s=\"171\""));
-        assert!(sheet.contains("$Q$7:$Q$11"));
+        assert!(sheet.contains("$T$7:$T$11"));
         assert!(!sheet.contains("Реко та облаштування"));
         assert!(sheet.contains("Реко"));
         assert!(sheet.contains("Облаштування"));
@@ -1581,6 +1730,115 @@ mod tests {
         let sheet = read_entry(&path, "xl/worksheets/sheet1.xml");
         assert!(sheet.contains("ЕКІПАЖ"));
         assert!(sheet.contains("Управління роти"));
+    }
+
+    #[test]
+    fn retains_shared_position_metadata_for_management_and_departments_in_filled_exports() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("noncrew-positions.xlsx");
+        let mut positioned_blocks = blocks();
+        positioned_blocks[0].position_name = " позиція управління ".into();
+        positioned_blocks[0].bro = " бро управління ".into();
+        positioned_blocks[0].work_sector = " сектор управління ".into();
+        positioned_blocks[0].uav_name = "Зайві дані БпАК".into();
+        positioned_blocks.push(StructureBlock {
+            id: "department".into(),
+            kind: BlockKind::Department,
+            name: "Відділення".into(),
+            position_name: "позиція відділення".into(),
+            slots: 1,
+            status: None,
+            uav_type: None,
+            bro: "бро відділення".into(),
+            work_sector: "сектор відділення".into(),
+            uav_name: "Ще зайві дані БпАК".into(),
+            crew_actual: 0,
+        });
+        let mut people = complete_people();
+        people.push(PersonInput {
+            block_id: "department".into(),
+            rank: "солдат".into(),
+            full_name: "КОВАЛЬ Іван".into(),
+            location: "ПУ".into(),
+            ..PersonInput::default()
+        });
+        let prepared = prepare(
+            "1 РУБАК".into(),
+            "08.10.2026".into(),
+            StructureType::Company,
+            6,
+            positioned_blocks,
+            people,
+            true,
+            path.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+
+        export_prepared(&prepared).unwrap();
+        let sheet = read_entry(&path, "xl/worksheets/sheet1.xml");
+        for (id, name, bro, sector) in [
+            (
+                "management",
+                "позиція управління",
+                "бро управління",
+                "сектор управління",
+            ),
+            (
+                "department",
+                "позиція відділення",
+                "бро відділення",
+                "сектор відділення",
+            ),
+        ] {
+            let block = prepared.blocks.iter().find(|block| block.id == id).unwrap();
+            assert_eq!(block.position_name, name);
+            assert_eq!(block.bro, bro);
+            assert_eq!(block.work_sector, sector);
+            assert!(block.uav_name.is_empty());
+            for (column_index, expected) in [(1, name), (2, bro), (3, sector)] {
+                assert!(sheet.contains(&text_cell(
+                    column_index,
+                    block.start_row,
+                    &expected.to_uppercase(),
+                    style_for(block),
+                )));
+            }
+        }
+        assert!(!sheet.contains("Зайві дані БпАК"));
+        assert!(!sheet.contains("Ще зайві дані БпАК"));
+        assert_eq!(summary_value(&sheet, "По списку"), 6);
+    }
+
+    #[test]
+    fn validates_position_metadata_for_noncrew_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        for invalid_bro in [true, false] {
+            let mut positioned_blocks = blocks();
+            if invalid_bro {
+                positioned_blocks[0].bro = "БРО\u{1}".into();
+            } else {
+                positioned_blocks[0].work_sector = "Сектор\u{1}".into();
+            }
+            let error = export_template(TemplateRequest {
+                unit_name: "1 РУБАК".into(),
+                report_date: "08.10.2026".into(),
+                structure_type: StructureType::Company,
+                authorized_strength: 5,
+                blocks: positioned_blocks,
+                output_path: directory
+                    .path()
+                    .join("invalid.xlsx")
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .unwrap_err();
+            assert!(error.contains(if invalid_bro {
+                "БРО позиції"
+            } else {
+                "Сектор роботи позиції"
+            }));
+            assert!(error.contains("містить недопустимий символ"));
+        }
     }
 
     #[test]
@@ -1881,7 +2139,7 @@ mod tests {
         assert_eq!(summary_value(&sheet, "По списку"), 6);
         assert_eq!(summary_value(&sheet, "Тимчасово прибулі"), 2);
         assert_eq!(summary_value(&sheet, "Тимчасово прибулі з ТВО"), 1);
-        assert!(sheet.contains("$Q$7:$Q$13,&quot;Тимчасові з ТВО&quot;"));
+        assert!(sheet.contains("$T$7:$T$13,&quot;temporaryActing&quot;"));
     }
 
     #[test]
@@ -1891,6 +2149,10 @@ mod tests {
             "ІВАНОВ Іван Іванович"
         );
         assert_eq!(format_full_name("петренко о.п."), "ПЕТРЕНКО О.П.");
+        assert_eq!(
+            format_full_name("дем’яненко лУК’ЯН мАР’ЯНОВИЧ"),
+            "ДЕМ’ЯНЕНКО Лук’ян Мар’янович"
+        );
     }
 
     #[test]
